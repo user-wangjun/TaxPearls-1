@@ -80,6 +80,22 @@ def _finding_dict(f: Finding) -> dict:
     }
 
 
+def material_sources(dataset: Dataset) -> list[str]:
+    """Use captured material names; never invent missing legacy provenance."""
+    if dataset.sources is not None:
+        return list(dict.fromkeys(dataset.sources)) or ["未记录材料来源"]
+    sources = []
+    if dataset.accounts:
+        sources.append("已保存的科目余额记录")
+    if dataset.declarations:
+        sources.append("已保存的申报记录")
+    if dataset.metrics:
+        sources.append("已保存的指标及取数证据")
+    if dataset.related_graph is not None:
+        sources.append("已保存的关联主体、关系及交易证据")
+    return sources + ["历史记录未保存完整材料清单；具体来源见证据卡"]
+
+
 def build_view_model(dataset: Dataset, findings: list[Finding]) -> dict:
     vm_findings = [_finding_dict(f) for f in findings]
     hit = [f for f in vm_findings if f["status"] == "hit"]
@@ -92,10 +108,7 @@ def build_view_model(dataset: Dataset, findings: list[Finding]) -> dict:
         "hit_findings": hit,
         "pass_findings": passed,
         "skipped_findings": skipped,
-        "sources": ["科目余额表", "增值税纳税申报表"] + (
-            ["补充指标（人工整理，来源见证据卡）"]
-            if any(m.source.startswith("补充指标!") for m in dataset.metrics.values()) else []
-        ),
+        "sources": material_sources(dataset),
         "summary": {
             "total": len(vm_findings),
             "hit": len(hit),

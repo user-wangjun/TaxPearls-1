@@ -1,5 +1,6 @@
 """Bounded, in-memory material import. PDF candidates always require review."""
 from __future__ import annotations
+from src import periods
 
 from dataclasses import asdict
 from datetime import date, datetime
@@ -12,7 +13,6 @@ from xml.etree import ElementTree
 from zipfile import ZipFile, BadZipFile
 
 import pdfplumber
-from openpyxl import load_workbook
 
 from . import config, loader, related_graph
 from .models import (
@@ -20,10 +20,10 @@ from .models import (
     RelatedSubject, RelatedTrade,
 )
 from .ai_extraction import ExtractionError
+from .workbooks import MAX_FILE, MAX_EXPANDED, open_workbook
 
 InputError = loader.InputError
-MAX_FILE = 10 * 1024 * 1024
-MAX_TOTAL = 50 * 1024 * 1024
+MAX_TOTAL = MAX_EXPANDED
 MAX_FILES = 20
 COMPANY_KEYS = ("name", "taxpayer_id", "industry", "period")
 
@@ -93,14 +93,11 @@ def expand_uploads(files):
 
 
 def _excel(data, doc):
-    # XLSX itself is a ZIP. Bound expansion before openpyxl allocates XML trees.
-    with ZipFile(BytesIO(data)) as archive:
-        if len(archive.infolist()) > 1000 or sum(i.file_size for i in archive.infolist()) > MAX_TOTAL:
-            raise InputError("Excel 解压内容超过限制。")
-    wb = load_workbook(BytesIO(data), data_only=False)
     try:
-        if any(ws.max_row > 30000 or ws.max_column > 100 for ws in wb):
-            raise InputError("每张 Excel 工作表最多 30000 行、100 列。")
+        wb = open_workbook(data)
+    except ValueError as exc:
+        raise InputError(str(exc)) from exc
+    try:
         company = Company("", "", "", "")
         if config.SHEET_COMPANY in wb.sheetnames:
             company = loader._read_company(wb)
@@ -362,10 +359,7 @@ def _unmapped_excel(data, doc):
              config.SHEET_BANK_ADJUSTMENTS, config.SHEET_HUMAN, config.SHEET_CONTRACTS,
              config.SHEET_FULFILLMENTS, config.SHEET_CONTRACT_LINKS, config.SHEET_SUPPLEMENT,
              related_graph.SHEET_SUBJECTS, related_graph.SHEET_RELATIONS, related_graph.SHEET_TRADES}
-    with ZipFile(BytesIO(data)) as archive:
-        if sum(i.file_size for i in archive.infolist()) > MAX_TOTAL or len(archive.infolist()) > 1000:
-            raise InputError("Excel 解压内容超过限制。")
-    wb = load_workbook(BytesIO(data), data_only=False, read_only=True)
+    wb = open_workbook(data, read_only=True)
     try:
         if known.intersection(wb.sheetnames):
             raise InputError("标准工作表校验失败，请先修正格式/重复项；AI 不覆盖原始输入错误。")
@@ -541,7 +535,7 @@ def build_dataset(documents, selections, company_override, keys):
             if category not in loader._BANK_LINKED_CATEGORIES | loader._BANK_STANDALONE_CATEGORIES:
                 raise InputError(f"{source}：银行调节「{number}」分类无效")
             period = _text(raw.get("period"))
-            loader._parse_period(period, f"{source} 银行调节「{number}」权责所属期")
+            periods.parse_period(period, f"{source} 银行调节「{number}」权责所属期")
             recognized = loader._number(raw.get("recognized_amount"), f"{source} 银行调节「{number}」本期不含税收入")
             amount = loader._number(raw.get("adjustment_amount"), f"{source} 银行调节「{number}」调节金额")
             reviewed = raw.get("reviewed")
@@ -671,7 +665,7 @@ def build_dataset(documents, selections, company_override, keys):
             key = _text(raw.get("name"))
             if key not in config.PERIOD_SERIES:
                 raise InputError(f"{source}：不支持的期间序列指标「{key}」")
-            period = loader._parse_period(raw.get("period"), f"{source} 期间序列")
+            period = periods.parse_period(raw.get("period"), f"{source} 期间序列")
             value = loader._number(raw.get("value"), f"{source} 期间序列")
             if value is None:
                 continue
@@ -790,7 +784,8 @@ def build_dataset(documents, selections, company_override, keys):
                 raise InputError(f"指标「{key}」与合同四流勾稽计算值冲突，请核对。")
             metric.source += "；" + metrics[key].source
         metrics[key] = metric
-    loader._derive_period_metrics(company, metrics, period_series)
+    periods.derive_period_metrics(company, metrics, period_series)
     if not metrics and graph is None:
         raise InputError("没有可执行核对的指标；请补充至少一个有效指标，缺失值不会当成零。")
-    return Dataset(company, list(accounts.values()), declarations, metrics, graph)
+    return Dataset(company, list(accounts.values()), declarations, metrics, graph,
+                   sources=list(dict.fromkeys(doc["name"] for doc in documents)))

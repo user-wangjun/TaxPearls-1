@@ -1,5 +1,6 @@
 """FR-C06: compare frozen findings, never infer resolution from missing checks."""
 from __future__ import annotations
+from src import periods
 
 from dataclasses import asdict
 from decimal import Decimal
@@ -23,8 +24,8 @@ def same_subject(before: dict, after: dict) -> bool:
 
 def comparable_periods(before: dict, after: dict) -> bool:
     try:
-        old = loader._parse_period(before["period"], "基期")
-        new = loader._parse_period(after["period"], "本期")
+        old = periods.parse_period(before["period"], "基期")
+        new = periods.parse_period(after["period"], "本期")
     except (loader.InputError, ValueError):
         return False
     return old.group == new.group and old.end < new.start
@@ -37,11 +38,11 @@ def baseline_candidates(history: list[dict], current: dict, latest_only: bool = 
     for row in history:
         if not same_subject(row, current) or not comparable_periods(row, current):
             continue
-        period = loader._parse_period(row["period"], "基期")
+        period = periods.parse_period(row["period"], "基期")
         eligible.append(row)
         chosen.setdefault(period.key, row)
     if not latest_only:
-        return sorted(eligible, key=lambda row: loader._parse_period(row["period"], "基期").key, reverse=True)
+        return sorted(eligible, key=lambda row: periods.parse_period(row["period"], "基期").key, reverse=True)
     return [chosen[key] for key in sorted(chosen, reverse=True)]
 
 
@@ -84,8 +85,8 @@ def compare(before: dict, after: dict) -> dict:
         raise ValueError("仅可比较同机构、同客户档案且纳税人识别号一致的审计。")
     if not comparable_periods(before, after):
         raise ValueError("基期须早于本期、互不重叠且期间粒度相同；同期间重审不属于跨期比较。")
-    old_period = loader._parse_period(before["period"], "基期")
-    new_period = loader._parse_period(after["period"], "本期")
+    old_period = periods.parse_period(before["period"], "基期")
+    new_period = periods.parse_period(after["period"], "本期")
     old = {f.rule.id: f for f in before["findings"]}
     new = {f.rule.id: f for f in after["findings"]}
     items = []

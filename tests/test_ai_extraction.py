@@ -5,7 +5,6 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
-import os
 from pathlib import Path
 import tempfile
 from threading import Thread
@@ -91,12 +90,12 @@ class AIContractTests(unittest.TestCase):
         for data in cases:
             opener = Mock()
             opener.open.return_value = BytesIO(data)
-            with patch("src.ai_extraction.build_opener", return_value=opener), self.assertRaises(ExtractionError):
+            with patch("src.ai_transport.build_opener", return_value=opener), self.assertRaises(ExtractionError):
                 call_model(SETTINGS, [], 5)
         for error in (TimeoutError("synthetic-secret"), HTTPError("https://example.com", 429, "synthetic-secret", {}, BytesIO(b"private data"))):
             opener = Mock()
             opener.open.side_effect = error
-            with patch("src.ai_extraction.build_opener", return_value=opener):
+            with patch("src.ai_transport.build_opener", return_value=opener):
                 with self.assertRaises(ExtractionError) as caught:
                     call_model(SETTINGS, [], 5)
                 self.assertNotIn("synthetic-secret", str(caught.exception))
@@ -145,6 +144,30 @@ class AIContractTests(unittest.TestCase):
         self.assertEqual([item["value"] for item in doc["rows"]], ["", ""])
         self.assertTrue(all("不能直接作为" in item["ai_issues"][-1] for item in doc["rows"]))
 
+    def test_conflicting_candidates_are_flagged_and_cannot_be_committed(self):
+        doc = document("单位：元\n销售额 本期 100000 累计 200000")
+        response = answer([row("100000", "元", "销售额 本期 100000 累计 200000"),
+                           row("200000", "元", "销售额 本期 100000 累计 200000")])
+        AIExtractor(SETTINGS, CATALOG, lambda *_: response).enrich(doc, b"")
+        self.assertEqual(doc["extraction"]["needs_attention"], 2)
+        self.assertTrue(all("不同候选值" in item["ai_issues"][-1] for item in doc["rows"]))
+        with self.assertRaisesRegex(materials.InputError, "冲突"):
+            materials.build_dataset([doc], {"0": {"id": "0", "reviewed": True}}, {}, set(CATALOG))
+        # Decimal-equivalent representations are not a conflict.
+        response.rows[1].raw_value = "100000.00"
+        AIExtractor(SETTINGS, CATALOG, lambda *_: response).enrich(doc, b"")
+        self.assertEqual(doc["extraction"]["needs_attention"], 0)
+
+    def test_unknown_unit_retains_missing_value_after_review(self):
+        doc = document("销售额 100000")
+        AIExtractor(SETTINGS, CATALOG, lambda *_: answer([
+            row("100000", "不明", "销售额 100000", uncertain=True)
+        ])).enrich(doc, b"")
+        self.assertEqual(doc["rows"][0]["value"], "")
+        self.assertIn("原始单位不明", doc["rows"][0]["ai_issues"])
+        with self.assertRaisesRegex(materials.InputError, "没有可执行"):
+            materials.build_dataset([doc], {"0": {"id": "0", "reviewed": True}}, {}, set(CATALOG))
+
     def test_failure_preserves_local_candidates_without_claiming_ai(self):
         def fail(*_):
             raise ExtractionError("模拟超时")
@@ -186,7 +209,7 @@ class AIWebTests(unittest.TestCase):
             old = app_module.store
             app_module.store = Store(Path(td)/"ai.db")
             try:
-                app_module.store.create_user("aiadmin", "ai-test-pass-2026", "AI测试", "platform_admin", "default")
+                app_module.store.create_user("aiadmin", "ai-test-pass-2026", "AI测试", "org_admin", "default")
                 with TestClient(app_module.app) as client, patch("webapp.material_upload.AISettings.from_env", return_value=replace(SETTINGS,vision=True)), patch("src.ai_extraction.call_model", return_value=answer([row("100000","元","增值税.销售额：100000")])):
                     client.post("/api/login",json={"username":"aiadmin","password":"ai-test-pass-2026"})
                     status = client.get("/api/materials/config")

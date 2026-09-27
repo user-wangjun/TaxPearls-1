@@ -193,7 +193,7 @@ class PeriodAggregationTests(unittest.TestCase):
             old_store = app_module.store
             app_module.store = Store(Path(directory) / "periods.db")
             try:
-                app_module.store.create_user("admin", "period-test-2026", "期间测试管理员", "platform_admin", "default")
+                app_module.store.create_user("admin", "period-test-2026", "期间测试管理员", "org_admin", "default")
                 with TestClient(app_module.app) as client:
                     self.assertEqual(client.post("/api/login", json={"username": "admin", "password": "period-test-2026"}).status_code, 200)
                     preview = client.post("/api/materials/preview", files={"files": ("periods.xlsx", book)}).json()

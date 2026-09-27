@@ -3,6 +3,7 @@
 These checks coach evidence, units and periods; they do not determine whether a
 rule is a correct answer, re-run the audit, change material or award points.
 """
+from src import periods
 from decimal import Decimal, InvalidOperation, localcontext
 import re
 
@@ -19,7 +20,7 @@ def _unit(key):
 
 def _period(dataset, key):
     if not key.startswith(("历史.", "年度.", "趋势.")):
-        return loader._parse_period(dataset.company.period, "案例期间")
+        return periods.parse_period(dataset.company.period, "案例期间")
     metric = dataset.metrics.get(key)
     if not metric:
         return None
@@ -33,7 +34,7 @@ def _period(dataset, key):
             return None
         text = match.group(1).strip()
     try:
-        return loader._parse_period(text, "来源期间")
+        return periods.parse_period(text, "来源期间")
     except loader.InputError:
         return None
 

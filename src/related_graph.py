@@ -4,6 +4,7 @@ The graph can identify a reviewed shareholder -> controlled company -> trade
 path. An anomaly remains a review lead, not a tax-law violation or AI verdict.
 """
 from __future__ import annotations
+from src import periods
 
 from datetime import date, datetime
 from decimal import Decimal
@@ -117,7 +118,7 @@ def read_workbook(wb, company: Company) -> RelatedGraph | None:
                                          state == "已复核", basis, source))
     trades: list[RelatedTrade] = []
     seen.clear()
-    period = loader._parse_period(company.period, "关联交易所属期")
+    period = periods.parse_period(company.period, "关联交易所属期")
     for row_no, (key, seller, buyer, traded_on, amount, anomaly, state) in _rows(wb, SHEET_TRADES, TRADE_HEADERS, 5000):
         source = f"{SHEET_TRADES}!第{row_no}行"
         key = _required(key, source + "交易编号", 64)

@@ -96,6 +96,8 @@ class Dataset:
     declarations: dict[str, Decimal | float]
     metrics: dict[str, Metric]
     related_graph: RelatedGraph | None = None
+    # None denotes legacy snapshots, whose available evidence is described conservatively.
+    sources: list[str] | None = None
 
     def values(self) -> dict[str, Decimal | float]:
         """供规则引擎求值用的扁平数值表。"""

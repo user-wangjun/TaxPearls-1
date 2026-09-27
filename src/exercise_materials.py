@@ -3,6 +3,7 @@
 Uses the same standard template and runtime Excel dependency as the loader.
 No local artifact-authoring runtime is required by the deployed application.
 """
+from src import periods
 from datetime import datetime
 from decimal import Decimal
 from io import BytesIO
@@ -79,7 +80,7 @@ def export(dataset):
         sheet(name, config.COL_STATEMENT, [(k[len(prefix):], dataset.metrics[k].value) for k in keys], [40, 24])
         mapped.update(keys)
     historical, supplement = [], []
-    year = loader._parse_period(company.period, "教学年度").end.year
+    year = periods.parse_period(company.period, "教学年度").end.year
     for key, metric in sorted(dataset.metrics.items()):
         if key in mapped:
             continue

@@ -166,7 +166,7 @@ class BankWebFlow(unittest.TestCase):
         self.db_path = Path(self.temp.name) / "bank.db"
         self.old_store = app_module.store
         app_module.store = Store(self.db_path)
-        app_module.store.create_user("bank-admin", "bank-test-2026", "银行测试", "platform_admin", "default")
+        app_module.store.create_user("bank-admin", "bank-test-2026", "银行测试", "org_admin", "default")
         self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username": "bank-admin", "password": "bank-test-2026"})
 

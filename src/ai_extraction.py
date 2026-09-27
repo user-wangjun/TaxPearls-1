@@ -8,10 +8,8 @@ from decimal import Decimal, InvalidOperation
 from io import BytesIO
 import json
 import re
-import socket
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from .ai_transport import chat_content, TransportError
 
 import pypdfium2
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -41,45 +39,17 @@ class Extraction(BaseModel):
     warnings: list[str] = Field(default_factory=list, max_length=30)
 
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 def call_model(settings, messages, timeout):
-    payload = {"model": settings.effective_model, "messages": messages,
-               "stream": False, "max_tokens": settings.max_tokens, "temperature": 0}
-    if settings.json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    if settings.disable_thinking:
-        payload["thinking"] = {"type": "disabled"}
-    request = Request(settings.base_url + "/chat/completions",
-                      data=json.dumps(payload, ensure_ascii=False).encode(),
-                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + settings.api_key}, method="POST")
     try:
-        # Never redirect credentials; never log upstream bodies, document text or keys.
-        with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                raise ExtractionError("AI 响应超过 2MB，已拒绝。")
-        envelope = json.loads(raw)
-        choice = envelope["choices"][0]
-        if choice.get("finish_reason") != "stop":
-            raise ExtractionError("AI 输出未完整结束（可能超出 token 限额），本次结果未采用。请拆分材料。")
-        content = choice["message"].get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ExtractionError("AI 返回空结果，本次结果未采用。")
-        return Extraction.model_validate_json(content)
-    except HTTPError as exc:
-        code = exc.code
-        exc.close()
-        hints = {401: "密钥无效", 403: "接口无权限", 404: "地址或模型名不存在", 429: "限流或额度不足"}
-        raise ExtractionError(f"AI 接口失败：HTTP {code}（{hints.get(code, '请检查网关协议、图像及 JSON 模式支持情况')}）。未自动重试。") from None
-    except (socket.timeout, TimeoutError):
-        raise ExtractionError("AI 提取超时，未自动重试。") from None
-    except URLError:
-        raise ExtractionError("AI 服务无法连接，请检查基础地址、网络和证书。") from None
-    except (ValueError, KeyError, IndexError, TypeError, ValidationError):
+        return Extraction.model_validate_json(chat_content(settings, messages, timeout))
+    except TransportError as exc:
+        if exc.kind == "http":
+            hints = {401: "密钥无效", 403: "接口无权限", 404: "地址或模型名不存在", 429: "限流或额度不足"}
+            raise ExtractionError(f"AI 接口失败：HTTP {exc.status}（{hints.get(exc.status, '请检查接口配置')}）。未自动重试。") from None
+        errors = {"timeout":"AI 提取超时，未自动重试。", "network":"AI 服务无法连接，请检查网络和证书。",
+                  "oversized":"AI 响应超过 2MB，已拒绝。", "incomplete":"AI 输出未完整结束，本次结果未采用。"}
+        raise ExtractionError(errors.get(exc.kind, "AI 返回的 JSON 不符合提取契约，本次结果未采用。")) from None
+    except ValidationError:
         raise ExtractionError("AI 返回的 JSON 不符合提取契约，本次结果未采用。") from None
 
 
@@ -117,7 +87,9 @@ SYSTEM = """你是税务材料数据提取器，只提取原件中的事实，�
 输出结构：{"company":{"name":null,"taxpayer_id":null,"industry":null,"period":null},"rows":[{"name":"标准指标名","raw_value":"原始数字字符串或null","unit":"元/千元/万元/人/比率/%/不明","page":1,"quote":"逐字原文，包含数字与栏次上下文","detail":"说明表名、金额列、业务口径及历史实际期间","uncertain":false}],"warnings":[]}。
 只使用提供的指标名称和取数口径。公司字段仅填原文明确写出的值，缺失填null，不得根据名称猜行业。
 raw_value保留原始数值，不做单位换算。负数保留符号，百分比用数字和unit=%。空白不是0。
+单位必须由原文明确给出；金额没有单位时unit填不明、uncertain填true，禁止按行业常识默认元。
 区分本期/累计/上期、账面/申报、借/贷发生额与余额。不能把利润表收入当成科目余额表收入。
+只提取核对期和指标口径对应的金额列；不能把本年累计/上期列作为本期指标的另一条有效候选。
 需要汇总计算、缺组成科目、合计口径不明时，raw_value填null并标uncertain；不自行猜算。
 quote必须是同一页/工作表中连续的逐字原文，不能拼凑。页码必须使用输入编号。
 图片取数时quote抄录原图数字和字段名。无法辨认、多个值不能确定、企业/期间混杂时明确写warnings。
@@ -225,6 +197,13 @@ class AIExtractor:
         unique = {}
         for row in rows:
             unique.setdefault((row["name"], row["value"], row["page"], row["detail"]), row)
+        values_by_name = {}
+        for row in unique.values():
+            if row["value"]:
+                values_by_name.setdefault(row["name"], set()).add(Decimal(row["value"]))
+        for row in unique.values():
+            if len(values_by_name.get(row["name"], ())) > 1:
+                row["ai_issues"].append("同一指标存在不同候选值，须核实本期/累计栏次及口径后删除或修正冲突行")
         doc.update(company=company, rows=list(unique.values()), review_required=True)
         doc["extraction"] = {"method": "ai", "model": usage_model, "calls": self.calls,
                              "needs_attention": sum(bool(r["ai_issues"]) for r in unique.values())}

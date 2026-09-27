@@ -5,6 +5,7 @@ declared inputs and white-listed expressions may be changed by the inverse
 solver. Generation is bounded and refuses unsatisfied or invalid conditions.
 """
 from __future__ import annotations
+from src import periods
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -214,7 +215,7 @@ def materialize(values, company, rules):
     for key, value in sorted(values.items()):
         if key in metrics:
             continue
-        source, detail = _source(key, inputs, loader._parse_period(company.period,"教学年度").end.year)
+        source, detail = _source(key, inputs, periods.parse_period(company.period,"教学年度").end.year)
         metrics[key] = Metric(key, value, source, detail)
     return Dataset(company, accounts, declarations, metrics)
 

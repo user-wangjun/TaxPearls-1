@@ -165,7 +165,7 @@ class InvoiceWebFlow(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_store = app_module.store
         app_module.store = Store(Path(self.temp.name) / "invoice.db")
-        app_module.store.create_user("invoice-admin", "invoice-test-2026", "发票测试", "platform_admin", "default")
+        app_module.store.create_user("invoice-admin", "invoice-test-2026", "发票测试", "org_admin", "default")
         self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username": "invoice-admin", "password": "invoice-test-2026"})
 
