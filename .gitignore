@@ -49,6 +49,7 @@ tmp/
 output/
 instance/
 backups/
+*.tpbackup
 .playwright-cli/
 .wrangler/
 

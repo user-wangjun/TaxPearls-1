@@ -14,4 +14,8 @@ tests
 .workbuddy
 node_modules
 prototype
+backups
+tmp
+.mimosa
+*.tpbackup
 *.log

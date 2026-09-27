@@ -17,5 +17,7 @@ uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 # P1 真实鉴权：Argon2id 加盐哈希（禁止明文、MD5、SHA1）
 argon2-cffi>=23.1.0
+# Authenticated database backup encryption (already pinned in requirements.lock).
+cryptography>=50,<51
 # 回归测试使用 FastAPI/Starlette TestClient
 httpx2>=2.13.0

@@ -1,78 +1,75 @@
-"""从 webapp 持久化库（instance/taxpearls.db）导出某条审计记录的 PDF 报告。
+"""Export frozen report bytes from a read-only database, never regenerate them.
 
-用法：
-    python scripts/export_audit_pdf.py              # 导出最新一条审计
-    python scripts/export_audit_pdf.py <audit_id>   # 导出指定审计
-    python scripts/export_audit_pdf.py --list       # 只列出审计记录
+    python scripts/export_audit_pdf.py --list
+    python scripts/export_audit_pdf.py AUDIT_ID --version 1 --output saved.pdf
 
-产物写入 output/，文件名与 Web 端导出一致：
-    税务风险审计报告-<企业简称>-<审计日期YYYYMMDD>.pdf
+PDF must already have been exported/archived in the workbench. An absent PDF
+is an error; --format html exports the frozen HTML instead. Existing files
+are never overwritten. The operator must be authorized to read the database.
 """
 from __future__ import annotations
 
-import json
+import argparse
+from contextlib import closing
+import os
+from pathlib import Path
+import re
 import sqlite3
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-
-from src import render  # noqa: E402
-from webapp.storage import deserialize_dataset, deserialize_findings  # noqa: E402
-
-DB_PATH = ROOT / "instance" / "taxpearls.db"
-OUT_DIR = ROOT / "output"
+from src import settings  # noqa: E402,F401 - load environment, no database initialization
+from webapp.storage import Store  # noqa: E402
 
 
-def main(argv: list[str]) -> int:
-    args = [a for a in argv if not a.startswith("--")]
-    if "--list" in argv:
-        con = sqlite3.connect(DB_PATH)
-        for row in con.execute(
-            "select id, company_name, period, audited_at from audits order by audited_at desc"
-        ):
-            print(f"{row[0]}  {row[1]}  {row[2]}  {row[3]}")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("audit_id", nargs="?")
+    parser.add_argument("--database", type=Path)
+    parser.add_argument("--version", type=int)
+    parser.add_argument("--format", choices=("pdf", "html"), default="pdf")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--list", action="store_true")
+    args = parser.parse_args(argv)
+    path = args.database or Path(os.getenv("TAXPEARLS_DB") or ROOT / "instance/taxpearls.db")
+    if not path.is_absolute():
+        path = ROOT / path
+    try:
+        if not path.is_file():
+            raise ValueError("数据库不存在。")
+        if args.version is not None and (args.version < 1 or not args.audit_id):
+            raise ValueError("版本须为正整数，并同时指定审计编号。")
+        with closing(sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            if args.list:
+                for row in db.execute("SELECT audit_id,version,created_at,pdf_sha256 FROM audit_report_versions ORDER BY created_at DESC,version DESC"):
+                    print(row['audit_id'], 'v'+str(row['version']), row['created_at'], 'PDF' if row['pdf_sha256'] else 'HTML only')
+                return 0
+            clauses, values = [], []
+            if args.audit_id:
+                clauses.append('audit_id=?'); values.append(args.audit_id)
+            if args.version is not None:
+                clauses.append('version=?'); values.append(args.version)
+            where = ' WHERE '+' AND '.join(clauses) if clauses else ''
+            row = db.execute('SELECT * FROM audit_report_versions'+where+' ORDER BY created_at DESC,version DESC LIMIT 1',values).fetchone()
+            if row is None:
+                raise ValueError("没有匹配的冻结报告版本。")
+            Store._verify_report_version(row, full=True)
+            content = row['pdf_bytes'] if args.format=='pdf' else row['html'].encode('utf-8')
+            if content is None:
+                raise ValueError("该版本 PDF 尚未归档；请先在工作台导出，或使用 --format html。")
+            safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', row['audit_id'])[:64]
+            destination = args.output or ROOT / 'output' / f"archive-{safe_id}-v{row['version']}.{args.format}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open('xb') as stream:
+                stream.write(content)
+            print(f"已导出冻结原件：{destination.resolve()}")
         return 0
-
-    con = sqlite3.connect(DB_PATH)
-    if args:
-        row = con.execute(
-            "select id, company_name, audited_at, dataset_json, findings_json"
-            " from audits where id = ?",
-            (args[0],),
-        ).fetchone()
-    else:
-        row = con.execute(
-            "select id, company_name, audited_at, dataset_json, findings_json"
-            " from audits order by audited_at desc limit 1"
-        ).fetchone()
-    con.close()
-
-    if row is None:
-        print("库中没有审计记录", file=sys.stderr)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print(f"导出失败：{exc}", file=sys.stderr)
         return 1
 
-    audit_id, company_name, audited_at, dataset_json, findings_json = row
-    dataset = deserialize_dataset(json.loads(dataset_json))
-    findings = deserialize_findings(json.loads(findings_json))
 
-    from datetime import datetime
-
-    when = datetime.strptime(audited_at[:19], "%Y-%m-%d %H:%M:%S")
-    html, _ = render.render_html(dataset, findings, when=when, write=True)
-    report_no = render.make_report_no(company_name, when)
-    short = company_name[:12]
-    pdf_name = f"税务风险审计报告-{short}-{audited_at[:10].replace('-', '')}.pdf"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_path = render.export_pdf(html, OUT_DIR / pdf_name, report_no=report_no)
-
-    print(f"  审计 ID：{audit_id}")
-    print(f"  被审计单位：{company_name}（{findings and sum(1 for f in findings if f.hit)} 项命中 / 共 {len(findings)} 条规则）")
-    print(f"  PDF 报告：{pdf_path}")
-    print(f"  文件大小：{pdf_path.stat().st_size / 1024:.1f} KB")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+if __name__ == '__main__':
+    raise SystemExit(main())
