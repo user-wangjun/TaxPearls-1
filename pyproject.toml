@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = ["prototype", "tmp", "output", "backups"]
+
+[tool.ruff.lint]
+# Correctness gate for the existing codebase; formatting is opt-in to avoid
+# rewriting unrelated work while functional changes are being reviewed.
+select = ["E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
