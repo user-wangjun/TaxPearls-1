@@ -158,7 +158,7 @@ class RiskChangeApiTests(unittest.TestCase):
     def test_api_permissions_and_client_reassignment(self):
         with TestClient(module.app) as client:
             self.assertEqual(client.get("/api/audits/feb/changes").status_code,401)
-            for user,status in ((self.student,403),(self.outside,404),(self.other_acct,404),(self.platform,200)):
+            for user,status in ((self.student,403),(self.outside,404),(self.other_acct,404),(self.platform,403)):
                 self.login(client,user)
                 self.assertEqual(client.get("/api/audits/feb/changes").status_code,status)
             self.login(client,self.accountant)
@@ -177,7 +177,7 @@ class RiskChangeApiTests(unittest.TestCase):
             self.assertEqual(client.get("/api/audits/feb/changes?baseline_id=foreign").status_code,404)
             self.assertEqual(client.get("/api/audits/feb/changes?baseline_id=other-client").status_code,422)
             self.login(client,self.platform)
-            self.assertEqual(client.get("/api/audits/feb/changes?baseline_id=foreign").status_code,422)
+            self.assertEqual(client.get("/api/audits/feb/changes?baseline_id=foreign").status_code,403)
 
 
 if __name__ == "__main__":

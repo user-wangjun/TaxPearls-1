@@ -42,7 +42,7 @@ class KnowledgeTests(unittest.TestCase):
             "answer": "请核对收入口径。", "citations": ["R-001", "invented"]})}}]}
         opener = Mock()
         opener.open.return_value = BytesIO(json.dumps(response).encode())
-        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=opener):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=opener):
             result = ask_graph(self.graph, "R-001", "解释当前规则")
             self.assertEqual([n["id"] for n in result["citations"]], ["R-001"])
             payload = json.loads(opener.open.call_args.args[0].data)
@@ -57,7 +57,7 @@ class KnowledgeTests(unittest.TestCase):
         response = {"choices": [{"finish_reason": "stop", "message": {"content": '{"answer":"unsupported","citations":["invented"]}'}}]}
         opener = Mock()
         opener.open.return_value = BytesIO(json.dumps(response).encode())
-        with patch("webapp.knowledge.AISettings.from_env", return_value=AISettings(enabled=True, api_key="test")), patch("webapp.knowledge.urllib.request.build_opener", return_value=opener):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=AISettings(enabled=True, api_key="test")), patch("src.ai_transport.build_opener", return_value=opener):
             with self.assertRaises(HTTPException) as error:
                 ask_graph(self.graph, "R-001", "解释")
             self.assertEqual(error.exception.status_code, 502)
@@ -75,7 +75,7 @@ class KnowledgeTests(unittest.TestCase):
         opener = Mock()
         opener.open.return_value = BytesIO(json.dumps(response, ensure_ascii=False).encode())
         settings = AISettings(enabled=True, api_key="synthetic-test-key")
-        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=opener):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=opener):
             result = interpret_finding(finding)
         self.assertEqual(result["verdict"], "hit")
         self.assertEqual(result["citation"], finding.rule.id)
@@ -95,7 +95,7 @@ class KnowledgeTests(unittest.TestCase):
                 invalid = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(invalid_answer, ensure_ascii=False)}}]}
                 bad_opener = Mock()
                 bad_opener.open.return_value = BytesIO(json.dumps(invalid, ensure_ascii=False).encode())
-                with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=bad_opener):
+                with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=bad_opener):
                     with self.assertRaises(HTTPException) as error:
                         interpret_finding(finding)
                 self.assertEqual(error.exception.status_code, 502)
@@ -129,7 +129,7 @@ class KnowledgeTests(unittest.TestCase):
             return opener
 
         opener = opener_for(json.dumps(answer, ensure_ascii=False))
-        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=opener):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=opener):
             result = generate_audit_narrative(findings)
         self.assertEqual(result["summary"], summary)
         self.assertEqual(result["evidence_hash"], audit_narrative_hash(findings))
@@ -147,20 +147,20 @@ class KnowledgeTests(unittest.TestCase):
         for invalid_answer in invalid_answers:
             with self.subTest(invalid_answer=invalid_answer):
                 bad_opener = opener_for(json.dumps(invalid_answer, ensure_ascii=False))
-                with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=bad_opener):
+                with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=bad_opener):
                     with self.assertRaises(HTTPException) as error:
                         generate_audit_narrative(findings)
                 self.assertEqual(error.exception.status_code, 502)
 
         malformed = opener_for("not-json")
-        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=malformed):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=malformed):
             with self.assertRaises(HTTPException) as error:
                 generate_audit_narrative(findings)
         self.assertEqual(error.exception.status_code, 502)
 
         timeout = Mock()
         timeout.open.side_effect = TimeoutError()
-        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("webapp.knowledge.urllib.request.build_opener", return_value=timeout):
+        with patch("webapp.knowledge.AISettings.from_env", return_value=settings), patch("src.ai_transport.build_opener", return_value=timeout):
             with self.assertRaises(HTTPException) as error:
                 generate_audit_narrative(findings)
         self.assertEqual(error.exception.status_code, 502)
@@ -178,7 +178,7 @@ class FindingInterpretationWebTests(unittest.TestCase):
             old_store = app_module.store
             app_module.store = Store(path)
             try:
-                app_module.store.create_user("admin", "interpret-test-2026", "管理员", "platform_admin", "org-a")
+                app_module.store.create_user("admin", "interpret-test-2026", "管理员", "org_admin", "org-a")
                 app_module.store.create_user("student", "interpret-test-2026", "学生", "student", "org-a")
                 with TestClient(app_module.app) as client:
                     login = client.post("/api/login", json={"username": "admin", "password": "interpret-test-2026"})
@@ -232,7 +232,7 @@ class FindingInterpretationWebTests(unittest.TestCase):
             old_store = app_module.store
             app_module.store = Store(path)
             try:
-                app_module.store.create_user("admin", "narrative-test-2026", "管理员", "platform_admin", "org-a")
+                app_module.store.create_user("admin", "narrative-test-2026", "管理员", "org_admin", "org-a")
                 app_module.store.create_user("student", "narrative-test-2026", "学生", "student", "org-a")
                 with TestClient(app_module.app) as client:
                     login = client.post("/api/login", json={"username": "admin", "password": "narrative-test-2026"})

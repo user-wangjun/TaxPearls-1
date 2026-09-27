@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
-from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -19,14 +20,20 @@ from webapp.storage import Store
 
 class RegistrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.browser=app_module.email_auth.browser_secret()
+        env=patch.dict(os.environ,{'TAXPEARLS_PUBLIC_BASE_URL':'http://localhost'})
+        env.start();self.addCleanup(env.stop)
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
         self._restore = (app_module.store, app_module.login_guard, app_module.reset_limiter,
-                         app_module.register_code_limiter, app_module.send_registration_code_email)
+                         app_module.register_code_limiter, app_module.send_registration_code_email,
+                         app_module.register_complete_limiter)
         app_module.store = Store(Path(self._directory.name) / "register.db")
         app_module.login_guard = LoginGuard()
         app_module.reset_limiter = RateLimiter({"email": (50, 15 * 60), "ip": (500, 60 * 60)})
         app_module.register_code_limiter = RateLimiter({"email": (50, 15 * 60), "ip": (500, 60 * 60)})
+        # Each test is a fresh deployment; keep real completion limits intact.
+        app_module.register_complete_limiter = RateLimiter({"email": (10, 15 * 60), "ip": (60, 60 * 60)})
         self.sent: list[dict[str, str]] = []
 
         def capture(*, to: str, code: str, signup_url: str, expires_minutes: int = 10) -> str:
@@ -41,10 +48,15 @@ class RegistrationTests(unittest.TestCase):
 
     def _restore_all(self) -> None:
         (app_module.store, app_module.login_guard, app_module.reset_limiter,
-         app_module.register_code_limiter, app_module.send_registration_code_email) = self._restore
+         app_module.register_code_limiter, app_module.send_registration_code_email,
+         app_module.register_complete_limiter) = self._restore
 
     def _client(self) -> TestClient:
-        return TestClient(app_module.app)
+        # Separate HTTP clients represent tabs sharing the initiating browser,
+        # not shared logged-in identities. Cross-browser rejection has its own tests.
+        client=TestClient(app_module.app,base_url='http://localhost')
+        client.cookies.set(app_module.EMAIL_COOKIE_NAME,self.browser)
+        return client
 
     def _setup_platform_admin(self) -> None:
         app_module.store.create_initial_admin("rootadmin", "strong-pass-2026", "平台管理",
@@ -71,14 +83,13 @@ class RegistrationTests(unittest.TestCase):
 
     def _code_from_last_mail(self) -> str:
         self.assertTrue(self.sent, "应当已发送验证邮件")
-        return parse_qs(urlsplit(self.sent[-1]["signup_url"]).query)["code"][0]
+        return self.sent[-1]['code']
 
     def test_invite_creation_requires_platform_admin(self):
         self._setup_platform_admin()
         client = self._client()
         client.post("/api/login", json={"username": "rootadmin", "password": "strong-pass-2026"})
-        client.post("/api/users", json={"username": "orgboss", "password": "strong-pass-2026",
-                                        "display_name": "机构管理员", "role": "org_admin", "org_id": "org-a"})
+        app_module.store.create_user("orgboss", "strong-pass-2026", "机构管理员", "org_admin", "org-a")
         client.post("/api/logout")
         client.post("/api/login", json={"username": "orgboss", "password": "strong-pass-2026"})
         forbidden = client.post("/api/invites", json={

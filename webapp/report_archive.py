@@ -7,7 +7,7 @@ import json
 
 from src import render
 from src.report_protection import protect_html
-from webapp.storage import serialize_dataset, serialize_findings
+from src.snapshots import serialize_dataset, serialize_findings
 
 
 def digest(data: bytes) -> str:

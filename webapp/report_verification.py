@@ -19,7 +19,7 @@ class CheckBody(BaseModel):
 def register(app, store_provider, user_for_session, allow, audit_for_user, cookie_name):
     def original(identifier, session):
         user=user_for_session(session)
-        allow(user,"org_admin","accountant","teacher","platform_admin")
+        allow(user,"org_admin","accountant","teacher")
         if not IDENTIFIER.fullmatch(identifier):
             raise HTTPException(404,"标识不存在或无权核验。")
         store=store_provider();target=store.report_protection_target(identifier,user)
@@ -32,7 +32,7 @@ def register(app, store_provider, user_for_session, allow, audit_for_user, cooki
                 manifest=record["manifest"] if record else {}
                 binding={"audit_id":target["audit_id"],"version":target["version"]}
             else:
-                if user["role"] not in {"org_admin","platform_admin"}:
+                if user["role"] not in {"org_admin"}:
                     raise HTTPException(404,"标识不存在或无权核验。")
                 record=store.get_org_report(target["org_report_id"],user)
                 manifest=record["snapshot"] if record else {}

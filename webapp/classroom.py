@@ -13,6 +13,9 @@ from fastapi import Cookie, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from webapp import training_profiles, training_stats
+from webapp.access import audit_row, current_actor
+
 
 class ClassroomError(ValueError):
     def __init__(self, message, status=422):
@@ -83,7 +86,7 @@ def can_access(db, item, user):
     if not item or item["org_id"] != user["org_id"]:
         return False
     if user["role"] == "teacher":
-        return not (item.get("class_id") or item.get("paper_id")) or item["created_by"] == user["id"]
+        return item["created_by"] == user["id"] and bool(audit_row(db, item["audit_id"], user))
     if user["role"] != "student" or not item["published"] or item["target_student_id"] not in (None,user["id"]):
         return False
     return not item.get("class_id") or bool(db.execute(
@@ -103,6 +106,7 @@ def check_submission(db, assignment_id, user):
 
 
 def owned_class(db, class_id, user):
+    current_actor(db, user, {'teacher'})
     row = db.execute("SELECT * FROM training_classes WHERE id=? AND org_id=? AND owner_id=?",
                      (class_id,user["org_id"],user["id"])).fetchone()
     if not row:
@@ -183,7 +187,7 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
     def students(session: str | None = Cookie(default=None,alias=cookie_name)):
         who = user(session,True)
         return response([{k:person[k] for k in ('id','username','display_name')}
-                         for person in store_provider().list_users(who['org_id'])
+                         for person in store_provider().list_users(who['org_id'], actor=who)
                          if person['role']=='student' and person['active']])
 
     @app.get("/api/classes")
@@ -191,11 +195,12 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
         who = user(session)
         with store_provider().connect() as db:
             db.execute("BEGIN")
+            current_actor(db, who)
             rows = db.execute("SELECT * FROM training_classes WHERE org_id=? ORDER BY created_at,id", (who['org_id'],)).fetchall()
             result=[]
             for row in rows:
                 item=dict(row)
-                roster=db.execute("SELECT u.id,u.username,u.display_name FROM training_class_members m JOIN users u ON u.id=m.student_id WHERE m.class_id=? ORDER BY u.username",(row['id'],)).fetchall()
+                roster=db.execute("SELECT u.id,u.username,u.display_name FROM training_class_members m JOIN users u ON u.id=m.student_id WHERE m.class_id=? AND u.org_id=? ORDER BY u.username",(row['id'],who['org_id'])).fetchall()
                 if who['role']=='teacher' and row['owner_id']==who['id']:
                     item['students']=[dict(s) for s in roster]; result.append(item)
                 elif who['role']=='student' and any(s['id']==who['id'] for s in roster):
@@ -209,12 +214,54 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
             sid=secrets.token_hex(12)
             with store_provider().connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                current_actor(db, who, {'teacher'})
                 validate_students(db,body.student_ids,who['org_id'])
                 db.execute("INSERT INTO training_classes VALUES (?,?,?,?,1,?)",(sid,who['org_id'],who['id'],clean_title(body.name),now().isoformat()))
                 db.executemany("INSERT INTO training_class_members VALUES (?,?)",[(sid,s) for s in body.student_ids])
-            store_provider().log(who,'create_class','class',sid,f"members={len(body.student_ids)}")
+                store_provider()._log(db,who,'create_class','class',sid,f"members={len(body.student_ids)}")
             return {'id':sid,'revision':1}
         return checked(create)
+
+    @app.get("/api/classes/{class_id}/statistics")
+    def class_statistics(class_id: str, include_withdrawn: bool = False,
+                         session: str | None = Cookie(default=None,alias=cookie_name)):
+        who = user(session,True)
+        def get():
+            with store_provider().connect() as db:
+                db.execute("BEGIN")
+                item = owned_class(db,class_id,who)
+                return training_stats.collect(db,item,include_withdrawn)
+        return checked(get)
+
+    @app.get("/api/training/profile")
+    def own_profile(session: str | None = Cookie(default=None,alias=cookie_name)):
+        who = user_for_session(session)
+        allow(who,'student')
+        def get():
+            with store_provider().connect() as db:
+                db.execute("BEGIN")
+                person = db.execute("SELECT * FROM users WHERE id=? AND org_id=? AND role='student' AND active=1",
+                                    (who['id'],who['org_id'])).fetchone()
+                if not person:
+                    raise ClassroomError("学生不存在。",404)
+                return training_profiles.collect(db,dict(person))
+        return checked(get)
+
+    @app.get("/api/classes/{class_id}/students/{student_id}/profile")
+    def student_profile(class_id: str, student_id: str, include_withdrawn: bool = False,
+                        session: str | None = Cookie(default=None,alias=cookie_name)):
+        who = user(session,True)
+        def get():
+            with store_provider().connect() as db:
+                db.execute("BEGIN")
+                item = owned_class(db,class_id,who)
+                person = db.execute("""SELECT u.* FROM users u JOIN training_class_members m ON m.student_id=u.id
+                    WHERE m.class_id=? AND u.id=? AND u.org_id=? AND u.role='student' AND u.active=1""",
+                    (class_id,student_id,who['org_id'])).fetchone()
+                if not person:
+                    raise ClassroomError("学生不存在。",404)
+                return training_profiles.collect(db,dict(person),item,include_withdrawn)
+        return checked(get)
 
     @app.put("/api/classes/{class_id}")
     def update_class(class_id: str,body: ClassUpdate,session: str | None = Cookie(default=None,alias=cookie_name)):
@@ -229,11 +276,12 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
                 db.execute("UPDATE training_classes SET name=?,revision=revision+1 WHERE id=?",(clean_title(body.name),class_id))
                 db.execute("DELETE FROM training_class_members WHERE class_id=?",(class_id,))
                 db.executemany("INSERT INTO training_class_members VALUES (?,?)",[(class_id,s) for s in body.student_ids])
-            store_provider().log(who,'update_class','class',class_id,f"revision={body.revision+1};members={len(body.student_ids)}")
+                store_provider()._log(db,who,'update_class','class',class_id,f"revision={body.revision+1};members={len(body.student_ids)}")
             return {'id':class_id,'revision':body.revision+1}
         return checked(update)
 
     def paper_for(db,paper_id,who):
+        current_actor(db, who, {'teacher', 'student'})
         row=db.execute("SELECT * FROM training_papers WHERE id=? AND org_id=?",(paper_id,who['org_id'])).fetchone()
         if not row or (who['role']=='teacher' and row['owner_id']!=who['id']):
             raise ClassroomError("试卷不存在。",404)
@@ -248,6 +296,7 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
             due=deadline(body.deadline_at)
             with store_provider().connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                current_actor(db, who, {'teacher'})
                 row=db.execute("SELECT * FROM assignments WHERE id=? AND org_id=? AND created_by=?",(assignment_id,who['org_id'],who['id'])).fetchone()
                 if not row:
                     raise ClassroomError("作业不存在。",404)
@@ -260,7 +309,7 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
                     raise ClassroomError("发布时截止时间必须在未来。")
                 db.execute("UPDATE assignments SET published=? WHERE id=?",(int(body.published),assignment_id))
                 db.execute("INSERT INTO training_assignment_settings (assignment_id,deadline_at,revision) VALUES (?,?,2) ON CONFLICT(assignment_id) DO UPDATE SET deadline_at=excluded.deadline_at,revision=training_assignment_settings.revision+1",(assignment_id,due))
-            store_provider().log(who,'update_assignment','assignment',assignment_id,f"revision={body.revision+1};published={body.published}")
+                store_provider()._log(db,who,'update_assignment','assignment',assignment_id,f"revision={body.revision+1};published={body.published}")
             return {'id':assignment_id,'revision':body.revision+1}
         return checked(update)
 
@@ -315,15 +364,17 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
                 raise ClassroomError("同一案例不能重复组入试卷。")
             with repo.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                current_actor(db, who, {'teacher'})
                 if body.class_id:
                     owned_class(db,body.class_id,who)
                 if body.published and due and datetime.fromisoformat(due)<=now():
                     raise ClassroomError("发布时截止时间必须在未来。")
                 db.execute("INSERT INTO training_papers VALUES (?,?,?,?,?,?,?,1,?)",(pid,who['org_id'],who['id'],clean_title(body.title),body.class_id,due,int(body.published),now().isoformat()))
                 for position,question in enumerate(body.items,1):
-                    entry=repo.get_audit(question.audit_id)
-                    if not entry or entry['org_id']!=who['org_id']:
+                    permitted=audit_row(db,question.audit_id,who)
+                    if not permitted:
                         raise ClassroomError("案例不存在。",404)
+                    entry=repo._audit_dict(permitted)
                     if not synthetic(entry['dataset']):
                         raise ClassroomError("组卷只能使用明确标记的仿真案例。")
                     hits={f.rule.id for f in entry['findings'] if f.status=='hit'}
@@ -332,7 +383,7 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
                     aid=secrets.token_hex(12)
                     db.execute("INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?,?,?)",(aid,who['org_id'],f"{body.title.strip()} · 第{position}题",question.audit_id,who['id'],None,json.dumps(question.weights,allow_nan=False),question.false_positive_penalty,int(body.published),now().isoformat()))
                     set_assignment_settings(db,aid,who,body.class_id,due,pid,position,question.points)
-            repo.log(who,'create_paper','paper',pid,f"cases={len(body.items)};published={body.published}")
+                repo._log(db,who,'create_paper','paper',pid,f"cases={len(body.items)};published={body.published}")
             return {'id':pid,'revision':1}
         return checked(create)
 
@@ -351,6 +402,6 @@ def register(app, store_provider, user_for_session, allow, synthetic, cookie_nam
                 db.execute("UPDATE training_papers SET published=?,deadline_at=?,revision=revision+1 WHERE id=?",(int(body.published),due,paper_id))
                 db.execute("UPDATE assignments SET published=? WHERE id IN (SELECT assignment_id FROM training_assignment_settings WHERE paper_id=?)",(int(body.published),paper_id))
                 db.execute("UPDATE training_assignment_settings SET deadline_at=? WHERE paper_id=?",(due,paper_id))
-            store_provider().log(who,'update_paper','paper',paper_id,f"revision={body.revision+1};published={body.published}")
+                store_provider()._log(db,who,'update_paper','paper',paper_id,f"revision={body.revision+1};published={body.published}")
             return {'id':paper_id,'revision':body.revision+1}
         return checked(update)

@@ -4,8 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import urllib.error
-import urllib.request
+from src.ai_transport import chat_content, TransportError
 from itertools import islice
 
 from fastapi import HTTPException
@@ -19,6 +18,7 @@ def node_id(kind, label):
 
 def build_graph(rules, entry=None):
     nodes, edges = {}, []
+    related_paths = {"shown": 0, "limit": 50, "truncated": False}
 
     def add(kind, label, **details):
         key = details.pop("id", None) or node_id(kind, label)
@@ -70,7 +70,10 @@ def build_graph(rules, entry=None):
         graph = dataset.related_graph
         subjects = {item.key: item for item in graph.subjects}
         audited = next(item for item in graph.subjects if item.taxpayer_id == dataset.company.taxpayer_id)
-        for share, control, trade in islice(related_graph.candidate_paths(dataset), 50):
+        paths = list(islice(related_graph.candidate_paths(dataset), related_paths["limit"] + 1))
+        related_paths.update(shown=min(len(paths), related_paths["limit"]),
+                             truncated=len(paths) > related_paths["limit"])
+        for share, control, trade in paths[:related_paths["limit"]]:
             owner = subjects[share.owner_key]
             other = subjects[control.company_key]
             owner_id = add("entity", owner.name, id="related:subject:" + owner.key,
@@ -85,7 +88,9 @@ def build_graph(rules, entry=None):
                              period=f"{control.start_on} 至 {control.end_on or '持续'}")
             trade_id = add("trade", "关联交易 " + trade.key, id="related:trade:" + trade.key,
                            category="关联方图", source=trade.source, value=str(trade.amount),
+                           period=trade.traded_on,
                            requirement=trade.anomaly_basis or "未提供异常依据",
+                           reason="交易尚未复核" if not trade.reviewed else "缺少异常依据" if not trade.anomaly_basis else "",
                            status="hit" if trade.reviewed and trade.anomaly_basis else "skipped")
             link(owner_id, share_id, "股东")
             link(share_id, company, "持股")
@@ -96,7 +101,7 @@ def build_graph(rules, entry=None):
             if trade.reviewed and trade.anomaly_basis and "finding:G-001" in nodes:
                 link(trade_id, "finding:G-001", "关联方图规则命中")
     return {"nodes": list(nodes.values()), "edges": edges,
-            "audit_id": entry["id"] if entry else None}
+            "audit_id": entry["id"] if entry else None, "related_paths": related_paths}
 
 
 def ai_config():
@@ -104,49 +109,22 @@ def ai_config():
     return (settings.base_url if not settings.problem() else ""), settings.effective_model, settings.api_key
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 def _chat_json(system_prompt, user_payload, failure_message):
     settings = AISettings.from_env()
-    problem = settings.problem()
-    if problem:
-        raise HTTPException(503, "AI 尚未连接：请填写项目 .env 的模型配置、启用 TAXPEARLS_AI_ENABLED 后重启服务。")
-    base, model, key = settings.base_url, settings.effective_model, settings.api_key
-    payload = {"model": model, "temperature": 0.2, "messages": [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-    ], "max_tokens": min(settings.max_tokens, 2048)}
-    if settings.json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    if settings.disable_thinking:
-        payload["thinking"] = {"type": "disabled"}
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = "Bearer " + key
-    request = urllib.request.Request(
-        base.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-    )
+    if settings.problem():
+        raise HTTPException(503, "AI 尚未连接：请检查项目模型配置。")
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=min(settings.timeout, 60)) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                raise ValueError("Response too large")
-            result = json.loads(raw)
-        if result["choices"][0].get("finish_reason") != "stop":
-            raise ValueError("Incomplete response")
-        content = result["choices"][0]["message"]["content"].strip()
+        content = chat_content(settings, [
+            {"role":"system", "content":system_prompt},
+            {"role":"user", "content":json.dumps(user_payload, ensure_ascii=False)},
+        ], min(settings.timeout, 60), temperature=0.2, max_tokens=min(settings.max_tokens, 2048))
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0]
         answer = json.loads(content)
         if not isinstance(answer, dict):
             raise ValueError("Invalid answer schema")
-        return answer, model
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
+        return answer, settings.effective_model
+    except (TransportError, ValueError, KeyError, IndexError, TypeError):
         raise HTTPException(502, failure_message) from None
 
 

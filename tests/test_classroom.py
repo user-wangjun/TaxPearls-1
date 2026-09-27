@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import os
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -13,7 +14,8 @@ from fastapi.testclient import TestClient
 from scripts.ops_db import create_backup, restore_backup
 from src import training
 from webapp import app as module, classroom
-from webapp.storage import Store
+from webapp.storage import Store, serialize_dataset
+from webapp.access import AccessDenied
 
 
 class ClassroomTests(unittest.TestCase):
@@ -61,6 +63,56 @@ class ClassroomTests(unittest.TestCase):
 
     def submit(self,aid,answers):
         return self.client.post('/api/assignments/'+aid+'/submit',json={'selected_rule_ids':answers})
+
+    def test_teaching_mutations_and_logs_commit_or_roll_back_together(self):
+        pid = self.paper(True)
+        aid = self.paper_cases(pid)[0]['id']
+        single_body = {'title': '独立作业', 'audit_id': self.cases[0]['audit_id'], 'published': True}
+        single = self.client.post('/api/assignments', json=single_body).json()['id']
+        self.login(self.student)
+        self.assertEqual(self.submit(aid, []).status_code, 200)
+        submission = self.store.get_submission(aid, self.student['id'])['id']
+        operations = [
+            (self.teacher, 'post', '/api/classes', {'name': '新班', 'student_ids': [self.other['id']]}, 'create_class'),
+            (self.teacher, 'put', '/api/classes/' + self.class_id,
+             {'name': '改班', 'student_ids': [self.other['id']], 'revision': 1}, 'update_class'),
+            (self.teacher, 'post', '/api/papers',
+             {'title': '新卷', 'items': [{'audit_id': self.cases[0]['audit_id']}]}, 'create_paper'),
+            (self.teacher, 'put', '/api/papers/' + pid,
+             {'revision': 1, 'published': False, 'deadline_at': None}, 'update_paper'),
+            (self.teacher, 'post', '/api/assignments', single_body, 'create_assignment'),
+            (self.teacher, 'put', '/api/assignments/' + single + '/settings',
+             {'revision': 1, 'published': False, 'deadline_at': None}, 'update_assignment'),
+            (self.student, 'post', '/api/assignments/' + aid + '/submit',
+             {'selected_rule_ids': self.cases[0]['metadata']['standard_answer']}, 'submit_assignment'),
+            (self.teacher, 'put', '/api/submissions/' + submission + '/review',
+             {'adjusted_score': 75, 'feedback': '人工复核'}, 'review_submission'),
+        ]
+        tables = ('training_classes', 'training_class_members', 'training_papers', 'assignments',
+                  'training_assignment_settings', 'submissions', 'training_mistake_cases', 'audit_log')
+        def state():
+            with self.store.connect() as db:
+                return {table: [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+                        for table in tables}
+        for actor, method, url, body, action in operations:
+            with self.subTest(action=action):
+                self.login(actor)
+                original = state()
+                with patch.object(self.store, '_log', side_effect=RuntimeError('audit log unavailable')):
+                    with self.assertRaisesRegex(RuntimeError, 'audit log unavailable'):
+                        self.client.request(method, url, json=body)
+                self.assertEqual(state(), original)
+        # The same requests succeed once logging recovers, without duplicate logs.
+        # Run dependent submission/review before the class/paper is withdrawn.
+        for actor, method, url, body, action in reversed(operations):
+            with self.subTest(recovered=action):
+                self.login(actor)
+                with self.store.connect() as db:
+                    count = db.execute('SELECT COUNT(*) FROM audit_log WHERE action=?', (action,)).fetchone()[0]
+                response = self.client.request(method, url, json=body)
+                self.assertEqual(response.status_code, 200, response.text)
+                with self.store.connect() as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM audit_log WHERE action=?', (action,)).fetchone()[0], count + 1)
 
     def test_class_roster_teacher_ownership_student_privacy_and_role_guard(self):
         roster=self.client.get('/api/classes/students').json()
@@ -298,8 +350,10 @@ class ClassroomTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/classes',json={'name':'无效学生班','student_ids':[self.other['id']]}).status_code,422)
         entry=deepcopy(self.store.get_audit(self.cases[0]['audit_id']))
         entry['dataset'].company.name='真实客户';entry['dataset'].company.taxpayer_id='91440100123456789X'
-        with patch.object(self.store,'get_audit',return_value=entry):
-            self.assertEqual(self.client.post('/api/papers',json={'title':'真实客户卷','items':[{'audit_id':self.cases[0]['audit_id']}]}).status_code,422)
+        with self.store.connect() as db:
+            db.execute('UPDATE audits SET dataset_json=? WHERE id=?',
+                       (json.dumps(serialize_dataset(entry['dataset'])),entry['id']))
+        self.assertEqual(self.client.post('/api/papers',json={'title':'真实客户卷','items':[{'audit_id':self.cases[0]['audit_id']}]}).status_code,422)
         for value in ['NaN','Infinity','-Infinity']:
             response=self.client.post('/api/papers',json={'title':'非法分值','items':[{'audit_id':self.cases[0]['audit_id'],'points':value}]})
             self.assertEqual(response.status_code,422);self.assertNotIn('input',response.text)
@@ -319,6 +373,126 @@ class ClassroomTests(unittest.TestCase):
         self.assertEqual(self.client.put('/api/assignments/'+aid+'/settings',json={'revision':1,'published':True,'deadline_at':due}).status_code,200)
         self.assertEqual(self.store.get_assignment(aid)['deadline_at'],'2030-01-01T00:00:00+00:00')
         self.assertEqual(self.store.get_assignment(aid)['class_id'],self.class_id)
+
+    def test_teacher_case_scope_blocks_business_and_other_teachers_before_processing(self):
+        own=self.cases[0]['audit_id']
+        admin=self.store.create_user('classroom-admin',self.password,'机构管理员','org_admin','school-a')
+        data=self.store.get_audit(own)['dataset']
+        business=module._save_audit(data,admin)['audit_id']
+        self.login(self.other_teacher)
+        foreign=self.client.post('/api/exercises',json={'rule_id':'R-020','seed':99,'expected_version':'2.0'}).json()['audit_id']
+        self.login(self.teacher)
+        self.assertEqual({r['id'] for r in self.client.get('/api/audits').json()}, {c['audit_id'] for c in self.cases})
+        with patch.object(module,'ask_graph') as ask, patch.object(module,'interpret_finding') as interpret, \
+                patch.object(module,'generate_audit_narrative') as narrative, patch.object(module,'engine') as engine:
+            for blocked in (foreign,business):
+                for path in [f'/api/audits/{blocked}',f'/api/audits/{blocked}/changes',
+                             f'/api/audits/{blocked}/report-versions',f'/api/report/{blocked}/html',
+                             f'/api/report/{blocked}?confirm=true',f'/api/knowledge/graph?audit_id={blocked}',
+                             f'/api/exercises/{blocked}',f'/api/exercises/{blocked}/materials']:
+                    with self.subTest(path=path):
+                        self.assertEqual(self.client.get(path).status_code,404,path)
+                for path,body in [(f'/api/audits/{blocked}/report-versions',None),
+                                  (f'/api/audits/{blocked}/narrative',None),
+                                  (f'/api/audits/{blocked}/findings/R-020/interpretation',None),
+                                  ('/api/knowledge/ask',{'audit_id':blocked,'node_id':'company','question':'解释证据'}),
+                                  ('/api/assignments',{'title':'越权出题','audit_id':blocked}),
+                                  ('/api/papers',{'title':'越权组卷','items':[{'audit_id':own},{'audit_id':blocked}]})]:
+                    self.assertEqual(self.client.post(path,json=body).status_code,404,path)
+                self.assertIsNone(self.store.get_generated_exercise(blocked,self.teacher))
+                self.assertIsNone(self.store.get_generated_material(blocked,self.teacher))
+            client_id=self.store.get_audit(business)['client_id']
+            with self.assertRaises(module.HTTPException):
+                module._save_audit(data,self.teacher,client_id)
+            engine.run.assert_not_called(); ask.assert_not_called(); interpret.assert_not_called(); narrative.assert_not_called()
+        with self.assertRaises(AccessDenied):
+            self.store.save_audit('teacher-linked-business',self.teacher,client_id,data,[],{},'2026-09-27')
+        real=deepcopy(data);real.company.name='真实企业';real.company.taxpayer_id='91440100123456789X'
+        with self.assertRaises(AccessDenied):
+            self.store.save_audit('teacher-real-data',self.teacher,None,real,[],{},'2026-09-27')
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM training_papers').fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM assignments').fetchone()[0],0)
+        for path in [f'/api/audits/{own}',f'/api/report/{own}/html',f'/api/exercises/{own}',f'/api/exercises/{own}/materials']:
+            self.assertEqual(self.client.get(path).status_code,200,path)
+
+    def test_legacy_assignment_is_author_owned_and_referenced_case_keeps_author_access(self):
+        own=self.cases[0]['audit_id']
+        aid=self.client.post('/api/assignments',json={'title':'旧单案例','audit_id':own,'published':True}).json()['id']
+        self.login(self.student)
+        self.assertEqual(self.submit(aid,self.cases[0]['metadata']['standard_answer']).status_code,200)
+        sub=self.store.get_submission(aid,self.student['id'])
+        self.login(self.other_teacher)
+        self.assertEqual(self.client.get('/api/assignments').json(),[])
+        for path in [f'/api/assignments/{aid}',f'/api/assignments/{aid}/materials']:
+            self.assertEqual(self.client.get(path).status_code,404)
+        self.assertEqual(self.client.get('/api/submissions',params={'assignment_id':aid}).json(),[])
+        self.assertEqual(self.client.put('/api/submissions/'+sub['id']+'/review',json={'adjusted_score':0,'feedback':'越权'}).status_code,404)
+        with self.assertRaises(AccessDenied):
+            self.store.review_submission(sub['id'],self.other_teacher['id'],0,'越权')
+        self.assertIsNone(self.store.get_submission(aid,self.student['id'])['adjusted_score'])
+        # Before the boundary fix a teacher could author a legacy assignment
+        # against a colleague's synthetic case. Keep that author's own work.
+        with self.store.connect() as db:
+            db.execute('UPDATE audits SET created_by=? WHERE id=?',(self.other_teacher['id'],own))
+        self.login(self.teacher)
+        for path in [f'/api/assignments/{aid}',f'/api/audits/{own}',f'/api/assignments/{aid}/materials']:
+            self.assertEqual(self.client.get(path).status_code,200)
+        self.assertEqual(self.client.put('/api/submissions/'+sub['id']+'/review',json={'adjusted_score':80,'feedback':'本人批改'}).status_code,200)
+        self.assertEqual(len(self.client.get('/api/submissions').json()),1)
+        reopened=Store(self.store.path)
+        self.assertIsNotNone(reopened.get_assignment_for_user(aid,self.teacher))
+        self.assertIsNone(reopened.get_assignment_for_user(aid,self.other_teacher))
+        self.assertEqual(reopened.get_submission(aid,self.student['id'])['adjusted_score'],80)
+
+    def test_teacher_logs_follow_teaching_objects_not_student_identity(self):
+        pid=self.paper(True);aid=self.paper_cases(pid)[0]['id'];own=self.cases[0]['audit_id']
+        self.login(self.student);self.assertEqual(self.submit(aid,[]).status_code,200)
+        sub=self.store.get_submission(aid,self.student['id'])
+        self.login(self.other_teacher)
+        othercase=self.client.post('/api/exercises',json={'rule_id':'R-020','seed':99,'expected_version':'2.0'}).json()['audit_id']
+        otheraid=self.client.post('/api/assignments',json={'title':'另一位老师的旧作业','audit_id':othercase,'published':True}).json()['id']
+        self.login(self.student);self.assertEqual(self.submit(otheraid,[]).status_code,200)
+        self.store.log(self.student,'private_student_login','session',self.student['id'],'OTHER-CLASS-PRIVATE')
+        self.store.log(self.other_teacher,'private_other_teacher','audit',othercase,'OTHER-CLASS-PRIVATE')
+        self.login(self.teacher)
+        self.assertEqual(self.client.put('/api/submissions/'+sub['id']+'/review',json={'adjusted_score':75,'feedback':'本班'}).status_code,200)
+        rows=self.client.get('/api/audit-log').json();targets={r['target_id'] for r in rows}
+        self.assertTrue({own,pid,aid,sub['id'],self.class_id,self.teacher['id']} <= targets)
+        self.assertNotIn(othercase,targets);self.assertNotIn(otheraid,targets);self.assertNotIn(self.student['id'],targets)
+        self.assertNotIn('OTHER-CLASS-PRIVATE',str(rows))
+        self.login(self.other_teacher)
+        targets={r['target_id'] for r in self.client.get('/api/audit-log').json()}
+        self.assertIn(otheraid,targets);self.assertNotIn(aid,targets);self.assertNotIn(sub['id'],targets)
+        admin=self.store.create_user('log-admin',self.password,'机构管理员','org_admin','school-a')
+        self.assertIn(otheraid,{r['target_id'] for r in self.store.list_logs(admin)})
+
+    def test_teacher_comparison_candidates_hide_other_teachers_same_identity(self):
+        data=deepcopy(self.store.get_audit(self.cases[0]['audit_id'])['dataset'])
+        ids=[]
+        for actor,period in [(self.teacher,'2026-01'),(self.other_teacher,'2026-02'),(self.teacher,'2026-03')]:
+            data.company.period=period
+            ids.append(module._save_audit(data,actor)['audit_id'])
+        response=self.client.get('/api/audits/'+ids[2]+'/changes')
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual([r['id'] for r in response.json()['baselines']],[ids[0]])
+        self.assertNotIn(ids[1],response.text)
+        self.assertEqual(self.client.get('/api/audits/'+ids[2]+'/changes',params={'baseline_id':ids[1]}).status_code,404)
+        with self.assertRaises(AccessDenied):
+            self.store.audit_history_for_comparison(self.store.get_audit(ids[1]),self.teacher)
+
+    def test_teacher_stale_identity_cannot_read_teaching_or_logs(self):
+        aid=self.client.post('/api/assignments',json={'title':'旧作业','audit_id':self.cases[0]['audit_id']}).json()['id']
+        with self.store.connect() as db:
+            db.execute("UPDATE users SET role='student' WHERE id=?",(self.teacher['id'],))
+        for operation in [lambda:self.store.list_logs(self.teacher),lambda:self.store.list_assignments(self.teacher),
+                          lambda:self.store.list_submissions(self.teacher),
+                          lambda:self.store.get_generated_exercise(self.cases[0]['audit_id'],self.teacher),
+                          lambda:self.store.get_generated_material(self.cases[0]['audit_id'],self.teacher),
+                          lambda:self.store.get_assignment_for_user(aid,self.teacher)]:
+            with self.assertRaises(AccessDenied):operation()
+        self.assertEqual(self.client.get('/api/audit-log').status_code,403)
+        self.assertEqual(self.client.get('/api/exercises/'+self.cases[0]['audit_id']).status_code,403)
 
     def test_classroom_frontend_asset_and_training_controls_served(self):
         script=self.client.get('/classroom.js')

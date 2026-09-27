@@ -106,19 +106,25 @@ function startClientUpload(){
   selectedClientId=client?.id||"";switchPanel("uploadPanel");
 }
 $("dashboardUpload").addEventListener("click",startClientUpload);
-async function loadDashboard() {
-  const body=$("dashboardBody");body.replaceChildren(el("div","empty","正在读取企业业务数据……"));
+let dashboardRequest = 0;
+async function loadDashboard(append = false) {
+  const ticket = ++dashboardRequest, userId = currentUser.id;
+  const body=$("dashboardBody");
+  if (!append) body.replaceChildren(el("div","empty","正在读取企业业务数据……"));
   try {
-    dashboardData=await api("/api/dashboard");
-    const select=$("dashboardCompany"),previous=select.value;select.textContent="";
-    const companies=new Map((dashboardData.clients||[]).map(c=>[c.taxpayer_id,c.name]));
-    for(const r of dashboardData.records)companies.set(companyKey(r),r.company_name);
-    for(const [key,name] of companies) option(select,key,name);
-    if(companies.has(previous)) select.value=previous;
-    if(!companies.size) option(select,"","暂无企业数据");
+    const company = $("dashboardCompany").value;
+    const page = append ? dashboardData.page + 1 : 1;
+    const data = await api("/api/dashboard?page=" + page + (company ? "&company=" + encodeURIComponent(company) : ""));
+    if (ticket !== dashboardRequest || currentUser?.id !== userId) return;
+    dashboardData = {...data, records:append ? [...dashboardData.records, ...data.records] : data.records};
+    const select=$("dashboardCompany");select.textContent="";
+    for (const item of data.companies) option(select,item.key,item.name);
+    select.value=data.company;
+    if (!data.companies.length) option(select,"","暂无企业数据");
     updatePeriods();
-  } catch(e){body.replaceChildren(el("div","empty","数据加载失败："+e.message),action("重新加载",loadDashboard));}
+  } catch(e){if(ticket===dashboardRequest)body.replaceChildren(el("div","empty","数据加载失败："+e.message),action("重新加载",()=>loadDashboard()));}
 }
+
 function updatePeriods(){
   const select=$("dashboardPeriod"),previous=select.value;select.textContent="";
   const rows=dashboardData.records.filter(r=>companyKey(r)===$("dashboardCompany").value);
@@ -127,11 +133,13 @@ function updatePeriods(){
   if(!rows.length)option(select,"","暂无期间");
   renderDashboard();
 }
-$("dashboardCompany").addEventListener("change",updatePeriods);
+$("dashboardCompany").addEventListener("change",()=>loadDashboard());
 $("dashboardPeriod").addEventListener("change",renderDashboard);
 function section(title){const s=el("div","sheet");s.append(el("h2",null,title));return s;}
 function renderDashboard(){
   const box=$("dashboardBody");box.textContent="";
+  if(dashboardData.has_more) box.append(action("加载更早期间（已载入 "+dashboardData.records.length+" / "+dashboardData.total_periods+"）",()=>loadDashboard(true)));
+  if(dashboardData.history_truncated) box.append(el("p","muted","最近审计显示最新 100 次；完整记录可在报告归档中检索。"));
   const rows=dashboardData.records.filter(r=>companyKey(r)===$("dashboardCompany").value);
   const r=rows.find(r=>r.period===$("dashboardPeriod").value);
   $("dashboardUpdated").textContent=r?"最近更新 "+r.audited_at:"";

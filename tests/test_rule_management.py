@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from src import engine, loader
 from webapp import app as app_module
 from webapp.storage import Store
+from webapp.access import AccessDenied
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,44 @@ SAMPLE = ROOT / "samples" / "样例企业-审计材料.xlsx"
 
 
 class RuleManagementTests(unittest.TestCase):
+    def test_publish_log_failure_rolls_back_new_version_and_previous_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'atomic-rules.db')
+            actor = store.create_user('atomicadmin', 'Atomic-pass-2026!', '管理员', 'platform_admin', 'org-a')
+            base = next(rule for rule in engine.load_rules(ROOT / 'rules') if rule.id=='R-001')
+            def publish(version, expected, start):
+                candidate = replace(base, version=version, effective_from=start)
+                return store.set_rule_override(base.id,version,candidate.logic,candidate.threshold_basis,
+                                               actor,expected,start,rule_snapshot=asdict(candidate))
+            publish('2.1','2.0','2026-01-01')
+            before = store.rule_versions()
+            overrides = store.rule_overrides()
+            with patch('webapp.members.log', side_effect=RuntimeError('local log failure')):
+                with self.assertRaises(RuntimeError):
+                    publish('2.2','2.1','2026-07-01')
+            self.assertEqual(store.rule_versions(),before)
+            self.assertEqual(store.rule_overrides(),overrides)
+            publish('2.2','2.1','2026-07-01')
+            self.assertEqual(store.rule_versions('R-001')['R-001'][0]['effective_to'],'2026-06-30')
+            with store.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM audit_log WHERE action='update_rule_parameters'").fetchone()[0],2)
+
+    def test_publish_rechecks_actor_in_write_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'revoked-rules.db')
+            actor = store.create_user('revokedadmin', 'Revoked-pass-2026!', '管理员', 'platform_admin', 'org-a')
+            base = next(rule for rule in engine.load_rules(ROOT / 'rules') if rule.id=='R-001')
+            candidate = replace(base,version='2.1')
+            for change in ["active=0", "role='org_admin'", "org_id='org-b'"]:
+                with store.connect() as db:
+                    db.execute("UPDATE users SET active=1,role='platform_admin',org_id='org-a' WHERE id=?",(actor['id'],))
+                    db.execute('UPDATE users SET '+change+' WHERE id=?',(actor['id'],))
+                with self.assertRaises(AccessDenied):
+                    store.set_rule_override(base.id,'2.1',candidate.logic,candidate.threshold_basis,
+                                            actor,'2.0',rule_snapshot=asdict(candidate))
+                self.assertEqual(store.rule_versions(),{})
+                self.assertEqual(store.rule_overrides(),{})
+
     def test_legacy_override_migration_preserves_undated_behavior(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy-rules.db"
@@ -56,7 +95,7 @@ class RuleManagementTests(unittest.TestCase):
                 candidate = replace(base, version=version)
                 try:
                     target.set_rule_override(base.id, version, candidate.logic, candidate.threshold_basis,
-                                             actor["id"], base.version, rule_snapshot=asdict(candidate))
+                                             actor, base.version, rule_snapshot=asdict(candidate))
                     return "saved"
                 except ValueError as exc:
                     self.assertIn("规则版本已变化", str(exc))
@@ -73,13 +112,16 @@ class RuleManagementTests(unittest.TestCase):
             old_store = app_module.store
             app_module.store = Store(db_path)
             try:
-                with TestClient(app_module.app) as client:
+                with TestClient(app_module.app) as client, TestClient(app_module.app) as manager:
                     response = client.post("/api/setup", json={
                         "username": "periodadmin", "password": "platform-pass-2026",
                         "display_name": "平台管理员", "org_id": "org-periods",
                     })
                     self.assertEqual(response.status_code, 200, response.text)
                     self.assertEqual(self._login(client, "periodadmin", "platform-pass-2026").status_code, 200)
+                    manager.cookies.update(client.cookies)
+                    app_module.store.create_user('periodowner', 'Owner-pass-2026!', '机构管理员', 'org_admin', 'org-periods')
+                    self.assertEqual(self._login(client, 'periodowner', 'Owner-pass-2026!').status_code, 200)
                     old_audit = self._upload(client)
                     old_report = client.get(f"/api/report/{old_audit}/html")
                     self.assertEqual(old_report.status_code, 200, old_report.text[:300])
@@ -89,7 +131,7 @@ class RuleManagementTests(unittest.TestCase):
                     def save(version, expected, threshold, start, end=None):
                         logic = deepcopy(base["logic"])
                         logic["threshold"] = threshold
-                        return client.put("/api/rules/R-001/parameters", json={
+                        return manager.put("/api/rules/R-001/parameters", json={
                             "expected_version": expected, "new_version": version,
                             "logic": logic, "threshold_basis": f"仿真 v{version} 阈值",
                             "effective_from": start, "effective_to": end,
@@ -121,7 +163,7 @@ class RuleManagementTests(unittest.TestCase):
                     self.assertEqual(self._rule(client, "R-001")["version"], "2.2")
                     third = save("2.3", "2.2", 0.1, "2027-01-01")
                     self.assertEqual(third.status_code, 200, third.text)
-                    versions = client.get("/api/rules/R-001/versions")
+                    versions = manager.get("/api/rules/R-001/versions")
                     self.assertEqual(versions.status_code, 200, versions.text)
                     self.assertEqual([item["version"] for item in versions.json()], ["2.1", "2.2", "2.3"])
                     self.assertEqual(versions.json()[1]["effective_to"], "2026-12-31")
@@ -140,17 +182,17 @@ class RuleManagementTests(unittest.TestCase):
                     year_data.company.period = "2026"
                     with self.assertRaisesRegex(Exception, "请拆分期间审计"):
                         app_module._audit_rules(year_data)
-                    disable = client.put("/api/rules/R-001/state", json={"enabled": False})
+                    disable = manager.put("/api/rules/R-001/state", json={"enabled": False})
                     self.assertEqual(disable.status_code, 200, disable.text)
                     enabled = app_module.store.enabled_rule_ids()
                     self.assertNotIn("R-001", {rule.id for rule in app_module._audit_rules(year_data, enabled)})
-                    self.assertEqual(client.put("/api/rules/R-001/state", json={"enabled": True}).status_code, 200)
+                    self.assertEqual(manager.put("/api/rules/R-001/state", json={"enabled": True}).status_code, 200)
                     old_result = client.get(f"/api/audits/{old_audit}").json()
                     old_rule = next(item for item in old_result["findings"] if item["id"] == "R-001")
                     self.assertEqual((old_rule["status"], old_rule["version"]), ("hit", "2.0"))
 
                     app_module.store = Store(db_path)
-                    self.assertEqual(len(client.get("/api/rules/R-001/versions").json()), 3)
+                    self.assertEqual(len(manager.get("/api/rules/R-001/versions").json()), 3)
                     restored = client.get(f"/api/audits/{old_audit}").json()
                     restored_rule = next(item for item in restored["findings"] if item["id"] == "R-001")
                     self.assertEqual((restored_rule["status"], restored_rule["version"]), ("hit", "2.0"))
@@ -177,18 +219,15 @@ class RuleManagementTests(unittest.TestCase):
                     self.assertEqual(self._login(client, "rootadmin", "platform-pass-2026").status_code, 200)
                     created_users = {}
                     for username, role, org_id in (
+                        ("orgowner", "org_admin", "org-a"),
                         ("teachera", "teacher", "org-a"),
                         ("accountanta", "accountant", "org-a"),
                         ("studenta", "student", "org-a"),
                         ("teacherb", "teacher", "org-b"),
                     ):
-                        response = client.post("/api/users", json={
-                            "username": username, "password": f"{username}-pass-2026",
-                            "display_name": username, "role": role, "org_id": org_id,
-                        })
-                        self.assertEqual(response.status_code, 200, response.text)
-                        created_users[username] = response.json()
+                        created_users[username] = app_module.store.create_user(username, f"{username}-pass-2026", username, role, org_id)
 
+                    self.assertEqual(self._login(client, 'orgowner', 'orgowner-pass-2026').status_code, 200)
                     assigned_client = client.post("/api/clients", json={
                         "name": "东莞市启明商贸有限公司（仿真样例）",
                         "taxpayer_id": "91441900MA5TEST0X0",
@@ -197,6 +236,7 @@ class RuleManagementTests(unittest.TestCase):
                     self.assertEqual(assigned_client.status_code, 200, assigned_client.text)
                     assigned_client_id = assigned_client.json()["id"]
 
+                    self.assertEqual(self._login(client, 'teachera', 'teachera-pass-2026').status_code, 200)
                     first_audit = self._upload(client)
                     rule = self._rule(client, "R-001")
                     self.assertEqual(rule["version"], "2.0")
@@ -263,6 +303,7 @@ class RuleManagementTests(unittest.TestCase):
 
                     client.post("/api/logout")
                     self._login(client, "rootadmin", "platform-pass-2026")
+                    self.assertEqual(client.post('/api/rules/R-001/trial', json=draft).status_code, 403)
                     saved = client.put("/api/rules/R-001/parameters", json=draft)
                     self.assertEqual(saved.status_code, 200, saved.text)
                     self.assertEqual(saved.json()["version"], "2.1")
@@ -272,6 +313,7 @@ class RuleManagementTests(unittest.TestCase):
                     stale["new_version"] = "2.2"
                     self.assertEqual(client.put("/api/rules/R-001/parameters", json=stale).status_code, 409)
 
+                    self.assertEqual(self._login(client, 'orgowner', 'orgowner-pass-2026').status_code, 200)
                     second_audit = self._upload(client)
                     new_result = client.get(f"/api/audits/{second_audit}").json()
                     new_r001 = next(item for item in new_result["findings"] if item["id"] == "R-001")

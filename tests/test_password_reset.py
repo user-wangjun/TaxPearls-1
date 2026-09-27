@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
@@ -23,14 +25,20 @@ from webapp.storage import Store
 
 class PasswordResetTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.browser=app_module.email_auth.browser_secret()
+        env=patch.dict(os.environ,{'TAXPEARLS_PUBLIC_BASE_URL':'http://localhost'})
+        env.start();self.addCleanup(env.stop)
+        verify=patch.object(app_module,'email_verify_limiter',RateLimiter({'token':(10,900),'ip':(60,900)}))
+        verify.start();self.addCleanup(verify.stop)
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
         old_store, old_limiter, old_sender = (app_module.store, app_module.reset_limiter,
                                               app_module.send_password_reset_email)
-        self._restore = (old_store, old_limiter, old_sender)
+        self._restore = (old_store, old_limiter, old_sender, app_module.reset_confirm_limiter)
         app_module.store = Store(Path(self._directory.name) / "reset.db")
         # 测试放宽限流，便于重复请求；限流本身由 test_rate_limit 覆盖。
         app_module.reset_limiter = RateLimiter({"email": (50, 15 * 60), "ip": (500, 60 * 60)})
+        app_module.reset_confirm_limiter = RateLimiter({"token": (5, 15 * 60), "ip": (40, 15 * 60)})
         self.sent: list[dict[str, str]] = []
 
         def capture(*, to: str, reset_url: str, expires_minutes: int = 10) -> str:
@@ -40,19 +48,25 @@ class PasswordResetTests(unittest.TestCase):
         app_module.send_password_reset_email = capture
 
     def tearDown(self) -> None:
-        old_store, old_limiter, old_sender = self._restore
+        old_store, old_limiter, old_sender, old_confirm_limiter = self._restore
         app_module.store, app_module.reset_limiter = old_store, old_limiter
         app_module.send_password_reset_email = old_sender
+        app_module.reset_confirm_limiter = old_confirm_limiter
 
     def _client(self) -> TestClient:
-        return TestClient(app_module.app)
+        client=TestClient(app_module.app,base_url='http://localhost')
+        client.cookies.set(app_module.EMAIL_COOKIE_NAME,self.browser)
+        return client
 
     def _setup_admin(self, email: str = "root@example.com") -> None:
         app_module.store.create_initial_admin("rootadmin", "strong-pass-2026", "管理", "default", email)
 
     def _token_from_last_mail(self) -> str:
         self.assertTrue(self.sent, "应当已发送重置邮件")
-        return parse_qs(urlsplit(self.sent[-1]["reset_url"]).query)["reset"][0]
+        token=parse_qs(urlsplit(self.sent[-1]['reset_url']).fragment)['email'][0]
+        verified=self._client().post('/api/auth/email/verify',json={'token':token})
+        self.assertEqual(verified.status_code,200,verified.text)
+        return verified.json()['proof']
 
     def test_unknown_email_gets_identical_response_without_sending(self):
         self._setup_admin()
@@ -133,11 +147,13 @@ class PasswordResetTests(unittest.TestCase):
 
     def test_duplicate_email_rejected_on_user_creation(self):
         self._setup_admin("taken@example.com")
+        app_module.store.create_user('duplicate-org-admin','strong-pass-2026','机构管理员','org_admin','default')
+        app_module.members.set_quota(app_module.store,app_module.store.get_user_by_email('taken@example.com'),'default',5,0)
         client = self._client()
-        client.post("/api/login", json={"username": "rootadmin", "password": "strong-pass-2026"})
+        client.post("/api/login", json={"username": "duplicate-org-admin", "password": "strong-pass-2026"})
         duplicate = client.post("/api/users", json={
             "username": "seconduser", "password": "strong-pass-2026",
-            "display_name": "第二人", "role": "teacher", "email": "Taken@Example.com",
+            "display_name": "第二人", "role": "accountant", "email": "Taken@Example.com",
         })
         self.assertEqual(duplicate.status_code, 409)
         self.assertIn("邮箱", duplicate.json()["detail"])

@@ -34,19 +34,17 @@ class ClientArchiveTests(unittest.TestCase):
 
                     users = {}
                     for username, role, org_id in (
+                        ("orgadmin", "org_admin", "org-a"),
                         ("accountant1", "accountant", "org-a"),
                         ("accountant2", "accountant", "org-a"),
                         ("student1", "student", "org-a"),
                         ("outsideadmin", "org_admin", "org-b"),
                         ("outsideacct", "accountant", "org-b"),
                     ):
-                        response = client.post("/api/users", json={
-                            "username": username, "password": f"{username}-pass-2026",
-                            "display_name": username, "role": role, "org_id": org_id,
-                        })
-                        self.assertEqual(response.status_code, 200, response.text)
-                        users[username] = response.json()
+                        users[username] = app_module.store.create_user(username, f"{username}-pass-2026", username, role, org_id)
 
+                    self.assertEqual(client.get('/api/clients').status_code, 403)
+                    self.assertEqual(client.post('/api/login', json={'username':'orgadmin','password':'orgadmin-pass-2026'}).status_code, 200)
                     rejected = client.post("/api/clients", json={
                         "name": "跨机构客户", "taxpayer_id": "OTHER-ORG",
                         "accountant_id": users["outsideacct"]["id"],

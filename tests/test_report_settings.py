@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import closing
 from io import BytesIO
 from pathlib import Path
@@ -26,6 +27,51 @@ def png(width: int = 160, height: int = 64, color=(20, 96, 170, 255)) -> bytes:
 
 
 class ReportTemplateSettingsTests(unittest.TestCase):
+    def test_stale_actor_cannot_read_or_mutate_branding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'branding.db')
+            actor = store.create_user('branding-admin', 'Branding-test-2026!', '管理员', 'org_admin', 'alpha')
+            store.update_org_settings('alpha', '原机构', '原标题', '原页脚')
+            store.update_org_logo('alpha', 'image/png', png())
+            original_settings, original_logo = store.get_org_settings('alpha'), store.get_org_logo('alpha')
+            with patch.object(app_module, 'store', store), patch.object(app_module, '_user', return_value=actor), TestClient(app_module.app) as client:
+                for changes in ({'active': 0}, {'org_id': 'beta'}, {'role': 'accountant'}):
+                    with store.connect() as db:
+                        db.execute("UPDATE users SET active=1,org_id='alpha',role='org_admin' WHERE id=?", (actor['id'],))
+                        for key, value in changes.items():
+                            db.execute(f'UPDATE users SET {key}=? WHERE id=?', (value, actor['id']))
+                    requests = [
+                        lambda: client.get('/api/org/settings'), lambda: client.get('/api/org/logo'),
+                        lambda: client.put('/api/org/settings', json={'display_name':'被改写','report_title':'被改写','footer_text':''}),
+                        lambda: client.post('/api/org/logo', files={'file':('logo.png',png(color=(200,0,0,255)),'image/png')}),
+                        lambda: client.delete('/api/org/logo'),
+                    ]
+                    for request in requests:
+                        with self.subTest(changes=changes, request=request):
+                            self.assertEqual(request().status_code, 403)
+                    self.assertEqual(store.get_org_settings('alpha'), original_settings)
+                    self.assertEqual(store.get_org_logo('alpha'), original_logo)
+
+    def test_branding_log_failure_rolls_back_every_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'branding.db')
+            actor = store.create_user('branding-admin', 'Branding-test-2026!', '管理员', 'org_admin', 'alpha')
+            store.update_org_settings('alpha', '原机构', '原标题', '原页脚')
+            store.update_org_logo('alpha', 'image/png', png())
+            original_settings, original_logo = store.get_org_settings('alpha'), store.get_org_logo('alpha')
+            with store.connect() as db:
+                db.execute("CREATE TRIGGER fail_brand_log BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'test audit log failure'); END")
+            with patch.object(app_module, 'store', store), patch.object(app_module, '_user', return_value=actor), TestClient(app_module.app, raise_server_exceptions=False) as client:
+                requests = [
+                    lambda: client.put('/api/org/settings', json={'display_name':'被改写','report_title':'被改写','footer_text':''}),
+                    lambda: client.post('/api/org/logo', files={'file':('logo.png',png(color=(200,0,0,255)),'image/png')}),
+                    lambda: client.delete('/api/org/logo'),
+                ]
+                for request in requests:
+                    self.assertEqual(request().status_code, 500)
+                    self.assertEqual(store.get_org_settings('alpha'), original_settings)
+                    self.assertEqual(store.get_org_logo('alpha'), original_logo)
+
     def test_old_database_gets_logo_columns(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.db"
@@ -57,15 +103,14 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                         "username": "rootadmin", "password": "platform-pass-2026",
                     }).status_code, 200)
                     for username, role, org_id in (
+                        ("admina", "org_admin", "org-a"),
                         ("adminb", "org_admin", "org-b"),
                         ("studentb", "student", "org-b"),
                     ):
-                        response = client.post("/api/users", json={
-                            "username": username, "password": f"{username}-pass-2026",
-                            "display_name": username, "role": role, "org_id": org_id,
-                        })
-                        self.assertEqual(response.status_code, 200, response.text)
+                        app_module.store.create_user(username, f"{username}-pass-2026", username, role, org_id)
 
+                    self.assertEqual(client.get('/api/org/settings').status_code, 403)
+                    self.assertEqual(client.post('/api/login', json={'username':'admina','password':'admina-pass-2026'}).status_code, 200)
                     xss_settings = {
                         "display_name": "甲机构<script>alert(1)</script>",
                         "report_title": "风险报告<img src=x onerror=alert(2)>",
@@ -96,6 +141,9 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                     })
                     self.assertEqual(uploaded.status_code, 200, uploaded.text)
                     self.assertTrue(uploaded.json()["has_logo"])
+                    with app_module.store.connect() as db:
+                        for action in ('setup', 'update_org_settings', 'update_org_logo'):
+                            self.assertEqual(db.execute('SELECT COUNT(*) FROM audit_log WHERE action=?', (action,)).fetchone()[0], 1)
                     logo = client.get("/api/org/logo")
                     self.assertEqual(logo.status_code, 200)
                     self.assertEqual(logo.headers["content-type"], "image/png")
@@ -138,6 +186,10 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                         })
                     self.assertEqual(audit.status_code, 200, audit.text)
                     audit_b = audit.json()["audit_id"]
+                    report_b = client.get(f"/api/report/{audit_b}/html")
+                    self.assertEqual(report_b.status_code, 200)
+                    self.assertIn("乙机构审计报告", report_b.text)
+                    self.assertNotIn("甲机构&lt;script&gt;", report_b.text)
                     client.post("/api/logout")
 
                     self.assertEqual(client.post("/api/login", json={
@@ -155,9 +207,11 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                         "username": "rootadmin", "password": "platform-pass-2026",
                     }).status_code, 200)
                     report_b = client.get(f"/api/report/{audit_b}/html")
-                    self.assertEqual(report_b.status_code, 200)
-                    self.assertIn("乙机构审计报告", report_b.text)
-                    self.assertNotIn("甲机构&lt;script&gt;", report_b.text)
+                    self.assertEqual(report_b.status_code, 403)
+                    self.assertEqual(client.get(f"/api/report/{audit_a}/html").status_code, 403)
+                    self.assertEqual(client.get('/api/org/logo').status_code, 403)
+                    self.assertEqual(client.post('/api/login', json={'username':'admina','password':'admina-pass-2026'}).status_code, 200)
+                    self.assertEqual(client.get(f"/api/report/{audit_a}/html").status_code, 200)
                     self.assertEqual(client.get("/api/org/logo").status_code, 200)
                     deleted = client.delete("/api/org/logo")
                     self.assertEqual(deleted.status_code, 200)

@@ -1,5 +1,6 @@
 """FR-D07: institution overview from frozen findings, not financial consolidation."""
 from __future__ import annotations
+from src import periods
 
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ LABELS = {"high":"有高等级命中", "medium":"有中等级命中", "low":"有
 
 def period_info(value):
     try:
-        return loader._parse_period(value, "机构报告期间")
+        return periods.parse_period(value, "机构报告期间")
     except (loader.InputError, ValueError):
         raise ValueError("机构报告期间须为完整的月/季/半年/年度期间。") from None
 
@@ -130,7 +131,7 @@ class OrgReportBody(BaseModel):
 
 def register(app, store_provider, user_for_session, allow, cookie_name):
     def actor(session):
-        user = user_for_session(session); allow(user,"org_admin","platform_admin"); return user
+        user = user_for_session(session); allow(user,"org_admin"); return user
 
     def draft(user, period="", client_ids=None):
         sources = store_provider().org_report_sources(user)
@@ -169,7 +170,6 @@ def register(app, store_provider, user_for_session, allow, cookie_name):
         html, snapshot["protection"] = protect_html(html,label,snapshot["created_at"][:10],snapshot["report_no"],
                                                    context=canonical(snapshot),registered=True)
         saved = store_provider().save_org_report(user,snapshot,html)
-        store_provider().log(user,"create_org_report","org_report",report_id,f"clients={len(data['rows'])};period={data['period']}")
         return {"id":report_id,"snapshot":snapshot,"html_sha256":saved["html_sha256"],"snapshot_sha256":saved["snapshot_sha256"]}
 
     @app.get("/api/org/reports")

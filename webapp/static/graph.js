@@ -3,21 +3,39 @@ const graphKinds={company:["企业","#d49b38"],entity:["关联主体","#a16fbd"]
 let graphData={nodes:[],edges:[]},graphSelected=null,graphVisible=new Set(),graphPositions=new Map(),graphTransform={x:0,y:0,k:1},graphFocused=false,graphRequest=0,graphBusy=false;
 const graphCanvas=$("graphCanvas");
 for(const [kind,[label,color]]of Object.entries(graphKinds)){const item=el("span",null,label);item.style.setProperty("--node-color",color);$("graphLegend").append(item);}
+function graphCurrent(ticket,owner){return ticket===graphRequest&&currentUser?.id===owner&&$("knowledgePanel").classList.contains("active");}
+function clearGraph(message=""){
+  graphSelected=null;graphData={nodes:[],edges:[]};graphVisible=new Set();graphPositions=new Map();graphFocused=false;graphTransform={x:0,y:0,k:1};graphDrag=null;
+  for(const id of ["knowledgeDetail","graphMessages","graphSummary"])$(id).replaceChildren();
+  graphCanvas.replaceChildren();graphCanvas.style.height="";graphCanvas.setAttribute("viewBox","0 0 960 680");
+  $("graphCount").textContent=message;$("graphCoverage").textContent="";$("graphCoverage").hidden=true;
+  $("graphAIStatus").textContent="尚未载入证据";$("graphSend").disabled=true;$("graphQuestion").value="";updateAIContext();
+}
+function invalidateGraph(){graphRequest++;clearGraph();}
 async function loadKnowledge(){
-  const select=$("graphAudit"),previous=select.value;
-  if(currentUser.role!=="student")try{const rows=await api("/api/audits");select.replaceChildren();option(select,"","规则知识图谱");for(const r of rows)option(select,r.id,r.company_name+" · "+r.period+" · "+r.audited_at);if(rows.some(r=>r.id===previous))select.value=previous;}catch(e){showError(e.message);}
-  await loadGraph();
+  const ticket=++graphRequest,owner=currentUser?.id,select=$("graphAudit"),previous=select.value;
+  clearGraph("正在载入可访问的审计…");select.disabled=true;
+  select.replaceChildren();option(select,"","规则知识图谱");
+  try{
+    if(["org_admin","accountant","teacher"].includes(currentUser?.role)){
+      const rows=await api("/api/audits");if(!graphCurrent(ticket,owner))return;
+      for(const r of rows)option(select,r.id,r.company_name+" · "+r.period+" · "+r.audited_at);
+      if(rows.some(r=>r.id===previous))select.value=previous;
+    }
+  }catch(e){if(graphCurrent(ticket,owner))$("graphCount").textContent=e.message;return;}
+  finally{if(graphCurrent(ticket,owner))select.disabled=false;}
+  if(graphCurrent(ticket,owner))await loadGraph();
 }
 async function loadGraph(){
-  const ticket=++graphRequest;$("graphCount").textContent="正在载入关系网络…";
-  graphSelected=null;graphData={nodes:[],edges:[]};graphCanvas.replaceChildren();$("knowledgeDetail").replaceChildren();$("graphMessages").replaceChildren();updateAIContext();
+  const ticket=++graphRequest,owner=currentUser?.id;clearGraph("正在载入关系网络…");
   try{
-    const data=await api("/api/knowledge/graph"+($("graphAudit").value?"?audit_id="+encodeURIComponent($("graphAudit").value):""));if(ticket!==graphRequest)return;
+    const data=await api("/api/knowledge/graph"+($("graphAudit").value?"?audit_id="+encodeURIComponent($("graphAudit").value):""));if(!graphCurrent(ticket,owner))return;
     graphData=data;graphPositions=new Map();graphFocused=false;graphTransform={x:0,y:0,k:1};
+    if(data.related_paths?.truncated){$("graphCoverage").hidden=false;$("graphCoverage").textContent=`关联方网络仅展示前 ${data.related_paths.shown} 条已复核关系候选路径，并非全部交易；G-001 的冻结结论仍基于全部路径，命中证据卡最多展示前 20 条。请结合原始台账核对其余路径。`;}
     $("graphAIStatus").textContent=data.ai.configured?"已配置模型 · "+data.ai.model:"AI 尚未连接 · 填写项目模型配置后启用";
     $("graphSend").disabled=!data.ai.configured||graphBusy;
     filterGraph();focusGraph();
-  }catch(e){if(ticket===graphRequest)$("graphCount").textContent=e.message;}
+  }catch(e){if(graphCurrent(ticket,owner)){clearGraph(e.message);}}
 }
 $("graphAudit").addEventListener("change",loadGraph);
 for(const id of ["knowledgeSearch","knowledgeCategory","graphStatus"])$(id).addEventListener(id==="knowledgeSearch"?"input":"change",()=>{graphFocused=false;filterGraph();});
@@ -25,13 +43,14 @@ function neighbors(ids){const result=new Set(ids);for(const e of graphData.edges
 function filterGraph(){
   const query=$("knowledgeSearch").value.trim().toLowerCase(),category=$("knowledgeCategory").value,status=$("graphStatus").value;
   let seeds=graphData.nodes.filter(n=>(!query||JSON.stringify(n).toLowerCase().includes(query))&&(!category||n.category===category)&&(!status||n.status===status));
-  if(category&&status){const ruleIds=new Set(graphData.nodes.filter(n=>n.category===category).map(n=>n.id));seeds=graphData.nodes.filter(n=>n.status===status&&ruleIds.has(n.rule_id)&&(!query||JSON.stringify(n).toLowerCase().includes(query)));}
+  if(category&&status){const ruleIds=new Set(graphData.nodes.filter(n=>n.category===category).map(n=>n.id));seeds=graphData.nodes.filter(n=>n.status===status&&(n.category===category||ruleIds.has(n.rule_id))&&(!query||JSON.stringify(n).toLowerCase().includes(query)));}
   graphVisible=neighbors(new Set(seeds.map(n=>n.id)));
   if(!graphSelected||!graphVisible.has(graphSelected))graphSelected=seeds.find(n=>n.kind==="rule"||n.kind==="risk")?.id||seeds[0]?.id||null;
   layoutGraph();drawGraph();renderNode();
 }
 function layoutGraph(){
   const nodes=graphData.nodes.filter(n=>graphVisible.has(n.id));
+  if(!nodes.length){graphCanvas.style.height="";graphCanvas.setAttribute("viewBox","0 0 960 680");return;}
   const groups=Object.keys(graphKinds).filter(k=>nodes.some(n=>n.kind===k));
   groups.forEach((kind,group)=>{const members=nodes.filter(n=>n.kind===kind),angle=group*2*Math.PI/groups.length-Math.PI/2,cx=480+Math.cos(angle)*220,cy=335+Math.sin(angle)*160;members.forEach((n,i)=>{const a=i*2.39996,r=22*Math.sqrt(i);graphPositions.set(n.id,{x:cx+Math.cos(a)*r,y:cy+Math.sin(a)*r});});});
   const links=graphData.edges.filter(e=>graphVisible.has(e.source)&&graphVisible.has(e.target));
@@ -121,9 +140,9 @@ $("nodeTab").addEventListener("click",()=>graphTab(false));$("aiTab").addEventLi
 document.querySelectorAll("[data-question]").forEach(b=>b.addEventListener("click",()=>{$("graphQuestion").value=b.dataset.question;$("graphQuestion").focus();}));
 $("graphQuestionForm").addEventListener("submit",async e=>{
   e.preventDefault();if(graphBusy)return;if(!graphSelected)return;const question=$("graphQuestion").value.trim();if(!question)return;
-  const node=graphSelected,audit=graphData.audit_id,version=graphRequest,box=$("graphMessages"),turn=el("div","ai-answer");turn.append(el("p","ai-question",question),el("p","muted","正在检索关联证据并生成解释…"));box.append(turn);graphBusy=true;$("graphSend").disabled=true;
-  try{const result=await api("/api/knowledge/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({node_id:node,audit_id:audit,question})});if(version!==graphRequest)return;turn.replaceChildren(el("p","ai-question",question),el("p","ai-text",result.answer),el("p","muted","证据引用 · 点击定位"));for(const cited of result.citations)turn.append(action(cited.label,()=>{graphSelected=cited.id;focusGraph();renderNode();}));$("graphQuestion").value="";
-  }catch(err){if(version===graphRequest)turn.replaceChildren(el("p","ai-question",question),el("p","ai-text",err.message));}finally{graphBusy=false;$("graphSend").disabled=!graphData.ai?.configured;}
+  const node=graphSelected,audit=graphData.audit_id,version=graphRequest,owner=currentUser?.id,box=$("graphMessages"),turn=el("div","ai-answer");turn.append(el("p","ai-question",question),el("p","muted","正在检索关联证据并生成解释…"));box.append(turn);graphBusy=true;$("graphSend").disabled=true;
+  try{const result=await api("/api/knowledge/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({node_id:node,audit_id:audit,question})});if(!graphCurrent(version,owner))return;turn.replaceChildren(el("p","ai-question",question),el("p","ai-text",result.answer),el("p","muted","证据引用 · 点击定位"));for(const cited of result.citations)turn.append(action(cited.label,()=>{graphSelected=cited.id;focusGraph();renderNode();}));if($("graphQuestion").value.trim()===question)$("graphQuestion").value="";
+  }catch(err){if(graphCurrent(version,owner))turn.replaceChildren(el("p","ai-question",question),el("p","ai-text",err.message));}finally{graphBusy=false;$("graphSend").disabled=!graphData.ai?.configured;}
 });
 
 let graphResizeTimer;window.addEventListener("resize",()=>{clearTimeout(graphResizeTimer);graphResizeTimer=setTimeout(()=>{if(graphData.nodes.length){layoutGraph();drawGraph();}},250);});

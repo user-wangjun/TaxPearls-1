@@ -8,6 +8,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from src import config, engine, loader, materials, related_graph, render
@@ -89,6 +90,73 @@ class RelatedGraphTests(unittest.TestCase):
         finding = related_graph.run(data)[0]
         self.assertIn("26 条", finding.conclusion)
         self.assertEqual(len(finding.evidence), 60)
+
+    def test_network_limit_is_explicit_without_truncating_frozen_rule_result(self):
+        for count in (50, 51):
+            with self.subTest(count=count):
+                wb = graph_workbook()
+                for number in range(2, count + 1):
+                    wb[related_graph.SHEET_TRADES].append(
+                        [f"T-{number}", "A", "B", "2026-03-20", 100000, "已复核异常依据", "已复核"]
+                    )
+                data = self._load(wb)
+                findings = related_graph.run(data)
+                network = build_graph([], {"id": "bounded", "dataset": data, "findings": findings})
+                self.assertEqual(network["related_paths"], {"shown": 50, "limit": 50, "truncated": count > 50})
+                self.assertEqual(len([n for n in network["nodes"] if n["kind"] == "trade"]), 50)
+                result = next(n for n in network["nodes"] if n["id"] == "finding:G-001")
+                self.assertIn(f"{count} 条", result["conclusion"])
+                ids = {n["id"] for n in network["nodes"]}
+                self.assertTrue(all(e["source"] in ids and e["target"] in ids for e in network["edges"]))
+
+    def test_network_trade_date_direction_and_unreviewed_reason(self):
+        wb = graph_workbook()
+        ws = wb[related_graph.SHEET_TRADES]
+        ws["B2"], ws["C2"], ws["G2"] = "B", "A", "待复核"
+        data = self._load(wb)
+        network = build_graph([], {"id": "pending", "dataset": data, "findings": related_graph.run(data)})
+        trade = next(n for n in network["nodes"] if n["kind"] == "trade")
+        self.assertEqual(trade["period"], "2026-03-20")
+        self.assertEqual(trade["status"], "skipped")
+        self.assertEqual(trade["reason"], "交易尚未复核")
+        self.assertIn({"source": "related:trade:T-1", "target": "related:subject:B", "label": "销售方"}, network["edges"])
+        self.assertFalse(any(e["label"] == "关联方图规则命中" for e in network["edges"]))
+
+    def test_graph_http_scope_reopen_and_current_assignment(self):
+        data = self._load(graph_workbook())
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = app_module.store
+            try:
+                db = Path(tmp) / "graph-http.db"
+                app_module.store = store = Store(db)
+                admin = store.create_user("graphowner", "Graph-test-2026!", "本机构", "org_admin", "graph-a")
+                accountant = store.create_user("graphstaff", "Graph-test-2026!", "会计", "accountant", "graph-a")
+                successor = store.create_user("graphnext", "Graph-test-2026!", "新负责人", "accountant", "graph-a")
+                foreign = store.create_user("graphforeign", "Graph-test-2026!", "其他机构", "org_admin", "graph-b")
+                customer = store.upsert_client(admin, data.company.name, data.company.taxpayer_id, accountant["id"])
+                result = app_module._save_audit(data, admin, customer["id"])
+                audit_id = result["audit_id"]
+                with TestClient(app_module.app) as client:
+                    _, token = store.authenticate(accountant["username"], "Graph-test-2026!")
+                    client.cookies.set(app_module.COOKIE_NAME, token)
+                    url = f"/api/knowledge/graph?audit_id={audit_id}"
+                    before = client.get(url)
+                    self.assertEqual(before.status_code, 200, before.text)
+                    self.assertIn("仿真股东甲", before.text)
+                    app_module.store = Store(db)
+                    self.assertEqual(client.get(url).json(), before.json())
+                    store.upsert_client(admin, data.company.name, data.company.taxpayer_id, successor["id"])
+                    self.assertEqual(client.get(url).status_code, 404)
+                    _, foreign_token = store.authenticate(foreign["username"], "Graph-test-2026!")
+                    client.cookies.clear()
+                    client.cookies.set(app_module.COOKIE_NAME, foreign_token)
+                    self.assertEqual(client.get(url).status_code, 404)
+                    public = client.get("/api/knowledge/graph")
+                    self.assertEqual(public.status_code, 200)
+                    self.assertNotIn("仿真股东甲", public.text)
+                    self.assertNotIn("related:trade:", public.text)
+            finally:
+                app_module.store = previous
 
     def test_bad_reference_and_out_of_period_trade_are_rejected(self):
         wb = graph_workbook()

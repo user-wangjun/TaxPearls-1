@@ -62,6 +62,30 @@ class ReportArchiveTests(unittest.TestCase):
         with self.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications WHERE audit_id='rollback'").fetchone()[0], 0)
 
+    def test_revoked_exporter_cannot_persist_pdf_after_render(self):
+        self.store.archive_report('legacy', self.admin, self.snapshot())
+        def revoke_while_rendering(_html, output, **_kwargs):
+            with self.store.connect() as db:
+                db.execute('UPDATE users SET active=0 WHERE id=?', (self.admin['id'],))
+            Path(output).write_bytes(b'%PDF-synthetic-render')
+        with patch.object(render, 'export_pdf', side_effect=revoke_while_rendering):
+            response = self.client.get('/api/report/legacy?version=1')
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIsNone(self.store.get_report_version('legacy', 1)['pdf_bytes'])
+
+    def test_archive_log_failure_rolls_back_version_and_protection(self):
+        url = '/api/audits/legacy/report-versions'
+        with patch.object(self.store, '_log', side_effect=RuntimeError('audit log unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'audit log unavailable'):
+                self.client.post(url)
+        self.assertEqual(self.store.report_versions('legacy'), [])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM report_protections').fetchone()[0], 0)
+        self.assertEqual(self.client.post(url).status_code, 200)
+        self.assertEqual(self.client.post(url).status_code, 200)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit_log WHERE action='archive_report'").fetchone()[0], 1)
+
     def test_legacy_first_archive_is_not_backdated_and_brand_changes_are_versions(self):
         self.assertEqual(self.client.get("/api/audits/legacy/report-versions").json(), [])
         first = self.client.post("/api/audits/legacy/report-versions").json()
@@ -95,7 +119,7 @@ class ReportArchiveTests(unittest.TestCase):
         narrative = {"overall_assessment": [{"text": "已核对的测试叙述", "rule_ids": ["R-001"]}],
                      "recommendations": [], "summary": self.summary, "model": "test-model",
                      "evidence_hash": module.audit_narrative_hash(self.findings)}
-        self.store.save_audit_narrative("legacy", narrative["evidence_hash"], narrative, self.admin["id"])
+        self.store.save_audit_narrative("legacy", narrative["evidence_hash"], narrative, self.admin)
         changed = self.client.get("/api/report/legacy/html")
         self.assertEqual(changed.headers["X-TaxPearls-Report-Version"], "3")
         self.assertIn("已核对的测试叙述", changed.text)

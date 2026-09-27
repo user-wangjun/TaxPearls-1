@@ -99,7 +99,7 @@ class ReportProtectionTests(unittest.TestCase):
         self.store.upsert_client(self.admin,self.customer["name"],self.customer["taxpayer_id"],replacement["id"])
         self.assertEqual(self.client.get("/api/report-verification/"+self.identifier).status_code,404)
         self.assertEqual(self.check(self.identifier,b"anything").status_code,404)
-        for role,org,expected in (("org_admin","org-b",404),("platform_admin","org-b",404),("student","org-a",403)):
+        for role,org,expected in (("org_admin","org-b",404),("platform_admin","org-b",403),("student","org-a",403)):
             user=self.store.create_user(role+org,self.password,role,role,org);self.login(user)
             self.assertEqual(self.client.get("/api/report-verification/"+self.identifier).status_code,expected)
             self.assertEqual(self.check(self.identifier,b"anything").status_code,expected)
@@ -158,8 +158,10 @@ class ReportProtectionTests(unittest.TestCase):
         from scripts.ops_db import create_backup,restore_backup
         org=self.client.post("/api/org/reports",json={}).json()
         originals=[]
-        for path,identifier in (("/api/report/protected?version=1",self.identifier),
-                                (f"/api/org/reports/{org['id']}/pdf",org["snapshot"]["protection"]["id"])):
+        for path,identifier,report_date in (("/api/report/protected?version=1",self.identifier,
+                                             self.snapshot["manifest"]["protection"]["report_date"]),
+                                (f"/api/org/reports/{org['id']}/pdf",org["snapshot"]["protection"]["id"],
+                                 org["snapshot"]["protection"]["report_date"])):
             response=self.client.get(path);self.assertEqual(response.status_code,200)
             with patch.object(logging.getLogger("pdfminer.pdffont"),"level",logging.ERROR),pdfplumber.open(io.BytesIO(response.content)) as document:
                 for page in document.pages:
@@ -175,7 +177,7 @@ class ReportProtectionTests(unittest.TestCase):
                     try:
                         value=text.get_text_range()
                         self.assertIn(identifier,value)
-                        self.assertIn("报告日期 2026-09-26",value)
+                        self.assertIn("报告日期 " + report_date,value)
                         self.assertIn(self.data.company.name if identifier==self.identifier else "多客户 1 户",value)
                     finally:text.close();page.close()
             self.assertTrue(self.check(identifier,response.content,"pdf").json()["sha256_matches"])

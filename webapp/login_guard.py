@@ -105,36 +105,45 @@ class RateLimiter:
 
     本项目约束为单进程单副本（FR-G08），内存态成立；若改为多进程，
     须迁移到集中式存储，否则计数失效。
-    字典容量有上限并按最近活跃淘汰，防止被大量伪造键撑爆内存。
+    字典容量有硬上限；只清理过期键，容量不足时拒绝新请求，不能通过
+    洪泛淘汰仍有效的限流记录。规则的所有维度必须同时提供。
     """
 
-    def __init__(self, rules: dict[str, tuple[int, int]], max_keys: int = 8192):
+    def __init__(self, rules: dict[str, tuple[int, int]], max_keys: int = 8192, clock=None):
         # rules: 维度名 -> (窗口内最大次数, 窗口秒数)
         self._rules = dict(rules)
+        if (not self._rules or type(max_keys) is not int or max_keys < len(self._rules)
+                or any(type(limit) is not int or type(window) is not int or limit <= 0 or window <= 0
+                       for limit, window in self._rules.values())):
+            raise ValueError("限流规则和容量必须为正整数，并容纳全部维度。")
         self._max_keys = max_keys
+        self._clock = clock or time.monotonic
         self._lock = RLock()
         self._hits: dict[tuple[str, str], list[float]] = {}
 
     def allow(self, **identifiers: str) -> bool:
         """所有维度均未超限时返回 True，并记录本次请求；任一超限返回 False。"""
-        now = time.monotonic()
+        if identifiers.keys() != self._rules.keys():
+            raise ValueError("限流请求必须提供全部且仅提供已配置维度。")
         keys = [(name, self._key(value)) for name, value in identifiers.items()]
         with self._lock:
+            now = self._clock()
+            # Prune by each dimension's own window, not the largest window.
+            for key in list(self._hits):
+                hits = [t for t in self._hits[key] if now - t < self._rules[key[0]][1]]
+                if hits:
+                    self._hits[key] = hits
+                else:
+                    del self._hits[key]
             for name, key in keys:
                 limit, window = self._rules[name]
-                hits = [t for t in self._hits.get((name, key), []) if now - t < window]
+                hits = self._hits.get((name, key), [])
                 if len(hits) >= limit:
-                    self._hits[(name, key)] = hits
                     return False
+            if len(self._hits) + sum(key not in self._hits for key in keys) > self._max_keys:
+                return False
             for name, key in keys:
-                limit, window = self._rules[name]
-                hits = [t for t in self._hits.get((name, key), []) if now - t < window]
-                hits.append(now)
-                self._hits[(name, key)] = hits
-            if len(self._hits) >= self._max_keys:
-                for stale in [k for k, v in self._hits.items()
-                              if not v or now - v[-1] >= max(w for _, w in self._rules.values())]:
-                    del self._hits[stale]
+                self._hits.setdefault((name, key), []).append(now)
             return True
 
     @staticmethod

@@ -17,6 +17,7 @@ from src import engine, loader, mailer, render
 from webapp import app as app_module
 from webapp.notifications import deliver_pending, email_content, safe_summary
 from webapp.storage import Store
+from webapp.access import AccessDenied
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,6 +42,107 @@ class NotificationTests(unittest.TestCase):
         app_module.store = self.old_store
         self.tmp.cleanup()
         self.env.stop()
+
+    def test_preferences_and_queue_cancellation_roll_back_when_log_fails(self):
+        user = self.accountant
+        self.store.set_notification_preferences(user, user['id'], True, False, True)
+        app_module._save_audit(self.dataset, self.admin, self.client['id'])
+        before = self.store.notification_preferences(user['id'])
+        with self.store.connect() as db:
+            queued = [tuple(r) for r in db.execute('SELECT * FROM notification_deliveries')]
+        with patch('webapp.members.log', side_effect=RuntimeError('local log failure')):
+            with self.assertRaises(RuntimeError):
+                self.store.set_notification_preferences(user, user['id'], False, False, False)
+        self.assertEqual(self.store.notification_preferences(user['id']), before)
+        with self.store.connect() as db:
+            self.assertEqual([tuple(r) for r in db.execute('SELECT * FROM notification_deliveries')], queued)
+
+    def test_retry_and_frozen_delivery_roll_back_when_log_fails(self):
+        user = self.accountant
+        self.store.set_notification_preferences(user, user['id'], True, False, True)
+        app_module._save_audit(self.dataset, self.admin, self.client['id'])
+        def unknown(**kwargs):
+            raise mailer.MailError('local failure')
+        deliver_pending(self.store, sender=unknown)
+        notice = self.store.list_notifications(user)[0]
+        with self.store.connect() as db:
+            before = tuple(db.execute('SELECT * FROM notification_deliveries').fetchone())
+        with patch('webapp.members.log', side_effect=RuntimeError('local log failure')):
+            with self.assertRaises(RuntimeError):
+                self.store.retry_notification_delivery(user, notice['id'])
+        with self.store.connect() as db:
+            self.assertEqual(tuple(db.execute('SELECT * FROM notification_deliveries').fetchone()), before)
+
+    def test_recipient_list_uses_current_actor_and_hides_private_addresses(self):
+        self.store.set_notification_preferences(self.accountant, self.accountant['id'], True, False, True)
+        rows = self.store.list_notification_recipients(self.admin)
+        self.assertEqual({r['id'] for r in rows}, {self.admin['id'], self.accountant['id']})
+        self.assertTrue(next(r for r in rows if r['id']==self.accountant['id'])['email_enabled'])
+        self.assertNotIn('@', json.dumps(rows))
+        with self.assertRaises(AccessDenied):
+            self.store.list_notification_recipients(self.accountant)
+        with self.store.connect() as db:
+            db.execute('UPDATE users SET org_id=? WHERE id=?', ('org-b', self.admin['id']))
+        with self.assertRaises(AccessDenied):
+            self.store.list_notification_recipients(self.admin)
+
+    def test_teacher_notifications_filter_at_enqueue_read_retry_and_delivery(self):
+        teachers=[self.store.create_user('notice-teacher-'+str(i),self.password,'教师'+str(i),'teacher','org-a',
+                                       'teacher'+str(i)+'@example.test') for i in range(2)]
+        for teacher in teachers:
+            self.store.set_notification_preferences(teacher,teacher['id'],True,False,True)
+        own=app_module._save_audit(self.dataset,teachers[0])['audit_id']
+        other=app_module._save_audit(self.dataset,teachers[1])['audit_id']
+        business=app_module._save_audit(self.dataset,self.admin,self.client['id'])['audit_id']
+        self.assertEqual([r['audit_id'] for r in self.store.list_notifications(teachers[0])],[own])
+        self.assertEqual([r['audit_id'] for r in self.store.list_notifications(teachers[1])],[other])
+        notice=self.store.list_notifications(teachers[0])[0]
+        # Simulate previously queued same-org notifications. No data is deleted;
+        # access and delivery must be re-evaluated under the new policy.
+        with self.store.connect() as db:
+            for suffix,audit_id in [('other',other),('business',business)]:
+                key='old-shared-'+suffix
+                db.execute("""INSERT INTO notifications SELECT ?,user_id,org_id,?,event,summary_json,created_at,NULL
+                              FROM notifications WHERE id=?""",(key,audit_id,notice['id']))
+                db.execute("""INSERT INTO notification_deliveries(notification_id,recipient_email,created_at,updated_at,status)
+                              SELECT ?,recipient_email,created_at,updated_at,'failed' FROM notification_deliveries
+                              WHERE notification_id=?""",(key,notice['id']))
+        with TestClient(app_module.app) as client:
+            client.cookies.set(app_module.COOKIE_NAME,self.store.authenticate(teachers[0]['username'],self.password)[1])
+            self.assertEqual([r['audit_id'] for r in client.get('/api/notifications').json()],[own])
+            for key in ['old-shared-other','old-shared-business']:
+                self.assertEqual(client.put('/api/notifications/'+key+'/read').status_code,404)
+                self.assertEqual(client.post('/api/notifications/'+key+'/retry').status_code,404)
+            self.assertEqual(client.put('/api/notifications/'+notice['id']+'/read').status_code,200)
+        with self.store.connect() as db:
+            db.execute("UPDATE notification_deliveries SET status='pending' WHERE notification_id LIKE 'old-shared-%'")
+        sent=[]
+        def sender(**kwargs):
+            sent.append(kwargs)
+            return 'local-teacher-delivery'
+        deliver_pending(self.store,sender=sender)
+        self.assertEqual(len(sent),2)
+        with self.store.connect() as db:
+            for key in ['old-shared-other','old-shared-business']:
+                self.assertEqual(db.execute('SELECT status FROM notification_deliveries WHERE notification_id=?',(key,)).fetchone()[0],'suppressed')
+                self.assertIsNone(db.execute('SELECT read_at FROM notifications WHERE id=?',(key,)).fetchone()[0])
+
+    def test_stale_teacher_notification_actor_is_rejected_before_mutation(self):
+        teacher=self.store.create_user('stale-teacher',self.password,'失效教师','teacher','org-a','stale@example.test')
+        self.store.set_notification_preferences(teacher,teacher['id'],True,False,True)
+        app_module._save_audit(self.dataset,teacher)
+        notice=self.store.list_notifications(teacher)[0]
+        with self.store.connect() as db:
+            db.execute('UPDATE users SET active=0 WHERE id=?',(teacher['id'],))
+        for operation in [lambda:self.store.list_notifications(teacher),
+                          lambda:self.store.mark_notification_read(teacher,notice['id']),
+                          lambda:self.store.retry_notification_delivery(teacher,notice['id']),
+                          lambda:self.store.set_notification_preferences(teacher,teacher['id'],False,False,False)]:
+            with self.assertRaises(AccessDenied):operation()
+        self.assertIsNone(self.store.claim_notification_delivery())
+        with self.store.connect() as db:
+            self.assertIsNone(db.execute('SELECT read_at FROM notifications WHERE id=?',(notice['id'],)).fetchone()[0])
+            self.assertEqual(db.execute('SELECT email_enabled FROM notification_preferences WHERE user_id=?',(teacher['id'],)).fetchone()[0],1)
 
     def test_local_http_worker_drains_restart_queue_and_never_resends_accepted(self):
         received = []
@@ -138,8 +240,12 @@ class NotificationTests(unittest.TestCase):
         class Redirect(BaseHTTPRequestHandler):
             def do_POST(inner):
                 paths.append(inner.path)
+                # Drain the POST body before closing: otherwise Windows can reset
+                # the socket instead of delivering this intentional 307 response.
+                inner.rfile.read(int(inner.headers.get("Content-Length", "0")))
                 inner.send_response(307)
                 inner.send_header("Location", f"http://127.0.0.1:{inner.server.server_port}/leak")
+                inner.send_header("Content-Length", "0")
                 inner.end_headers()
             def do_GET(inner):
                 paths.append(inner.path)
@@ -150,8 +256,9 @@ class NotificationTests(unittest.TestCase):
         thread = Thread(target=sink.serve_forever, daemon=True); thread.start()
         try:
             with patch.dict("os.environ", {"TAXPEARLS_RESEND_API_KEY":"dummy-local-test"}), patch.object(mailer,"API_ENDPOINT",f"http://127.0.0.1:{sink.server_port}/emails"):
-                with self.assertRaises(mailer.MailError):
+                with self.assertRaises(mailer.MailError) as raised:
                     mailer.send_email(to="recipient@example.test", subject="local", html="local")
+                self.assertEqual(raised.exception.status, 307)
             self.assertEqual(paths, ["/emails"])
         finally:
             sink.shutdown(); sink.server_close(); thread.join(timeout=2)

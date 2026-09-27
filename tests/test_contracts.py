@@ -6,10 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
-from src import config, engine, loader, materials
+from src import config, engine, materials
 from webapp import app as app_module
 from webapp.storage import Store
 
@@ -237,9 +238,15 @@ class ContractLedgerWebFlow(unittest.TestCase):
         self.old_store = app_module.store
         app_module.store = Store(self.db_path)
         app_module.store.create_user(
-            "contract-admin", "contract-test-2026", "合同测试", "platform_admin", "default"
+            "contract-admin", "contract-test-2026", "合同测试", "org_admin", "default"
         )
-        self.client = TestClient(app_module.app)
+        # Isolate transient upload drafts as well as the persisted test DB.
+        app = FastAPI(routes=[r for r in app_module.app.routes if not r.path.startswith("/api/materials/")],
+                      exception_handlers=app_module.app.exception_handlers,
+                      middleware=app_module.app.user_middleware)
+        app_module.register_material_upload(app, app_module._user, app_module._allow,
+                                            app_module._save_audit, app_module.RULES_DIR, app_module._audit_or_404)
+        self.client = TestClient(app)
         self.client.post("/api/login", json={"username": "contract-admin", "password": "contract-test-2026"})
 
     def tearDown(self):
@@ -266,6 +273,28 @@ class ContractLedgerWebFlow(unittest.TestCase):
         saved = Store(self.db_path).get_audit(audit_id)["dataset"]
         self.assertEqual(saved.get("合同.四流完整合同数量"), 1)
         self.assertIn("四流台账.xlsx", saved.source_of("合同.四流完整勾稽金额"))
+
+    def test_pending_and_complete_metrics_survive_history_without_changing_rule_counts(self):
+        for complete in (True, False):
+            with self.subTest(complete=complete):
+                draft = self.client.post("/api/materials/preview", files=[("files", (
+                    "归集来源.xlsx", contract_workbook(include_invoice=complete, include_bank=complete,
+                                                   include_fulfillment=complete, include_link=complete),
+                ))]).json()
+                result = self.client.post("/api/materials/audit", json={
+                    "token": draft["token"], "mode": "merge", "same_scope": True,
+                    "company": COMPANY, "selections": list(selections(draft["documents"]).values()),
+                })
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertFalse(result.json()["errors"])
+                audit = result.json()["results"][0]["audit"]
+                metrics = {m["name"]: m for m in audit["metrics"]}
+                self.assertEqual(metrics["合同.四流完整合同数量"]["value"], "1.00" if complete else "0.00")
+                self.assertEqual(metrics["合同.四流待完善合同数量"]["value"], "0.00" if complete else "1.00")
+                self.assertEqual(audit["summary"]["total"], len(audit["findings"]))
+                self.assertFalse(any(f["id"].startswith("合同.") for f in audit["findings"]))
+                app_module.store = Store(self.db_path)
+                self.assertEqual(self.client.get(f"/api/audits/{audit['audit_id']}").json(), audit)
 
 
 if __name__ == "__main__":

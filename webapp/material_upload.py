@@ -8,42 +8,27 @@ from threading import BoundedSemaphore, RLock
 
 from fastapi import BackgroundTasks, Cookie, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
-from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.formparsers import MultiPartException
+from webapp.uploads import bounded_stream, multipart
 from starlette.datastructures import UploadFile
 
 from src import engine, materials
 from src.ai_extraction import AIExtractor
 from src.settings import AISettings
+from webapp.access import AccessDenied
 
 
-class MemoryMultipart(MultiPartParser):
-    spool_max_size = materials.MAX_FILE + 1
-
-    def on_part_begin(self):
-        self.part_bytes = 0
-        super().on_part_begin()
-
-    def on_part_data(self, data, start, end):
-        self.part_bytes += end - start
-        if self._current_part.file is not None and self.part_bytes > materials.MAX_FILE:
-            raise MultiPartException("单个文件不能超过 10MB。")
-        super().on_part_data(data, start, end)
-
-
-async def bounded_stream(request, limit):
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > limit:
-            raise MultiPartException("请求体过大。")
-        yield chunk
-
-
-def register(app, get_user, allow, save_audit, rules_dir):
+def register(app, get_user, allow, save_audit, rules_dir, audit_for_user):
     drafts = {}
     jobs = {}
     ai_slots = BoundedSemaphore(2)
     lock = RLock()
+
+    def scope(user):
+        return {'owner': user['id'], 'org_id': user['org_id'], 'role': user['role']}
+
+    def belongs(record, user):
+        return record and all(record.get(k) == v for k, v in scope(user).items())
 
     def purge():
         for token in list(drafts):
@@ -65,7 +50,7 @@ def register(app, get_user, allow, save_audit, rules_dir):
     @app.get("/api/materials/config")
     def material_config(session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+        allow(user, "org_admin", "accountant", "teacher")
         return ai_settings().public_status()
 
     def save_preview(docs, catalog, user):
@@ -77,7 +62,7 @@ def register(app, get_user, allow, save_audit, rules_dir):
             if len(drafts) >= 20:
                 raise HTTPException(429, "待核对任务较多，请稍后再试。")
             token = secrets.token_urlsafe(32)
-            drafts[token] = {"owner": user["id"], "expires": time.monotonic() + 600,
+            drafts[token] = {**scope(user), "expires": time.monotonic() + 600,
                              "docs": docs, "catalog": catalog, "result": None}
         public = [{k: v for k, v in doc.items() if k not in {"accounts", "declarations"}} for doc in docs]
         return {"token": token, "documents": public, "fields": catalog, "expires_in": 600}
@@ -101,28 +86,26 @@ def register(app, get_user, allow, save_audit, rules_dir):
     @app.get("/api/materials/jobs/{job_id}")
     def job_status(job_id: str, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+        allow(user, "org_admin", "accountant", "teacher")
         with lock:
             purge()
             job = jobs.get(job_id)
-            if not job or job["owner"] != user["id"]:
+            if not belongs(job, user):
                 raise HTTPException(404, "提取任务不存在或已过期，请重新上传。")
-            return {k: v for k, v in job.items() if k not in {"owner", "expires"}}
+            return {k: v for k, v in job.items() if k not in {"owner", "org_id", "role", "expires"}}
 
     @app.post("/api/materials/preview")
     async def preview(request: Request, background: BackgroundTasks, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+        allow(user, "org_admin", "accountant", "teacher")
         if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
             raise HTTPException(422, "请以多文件表单上传材料。")
-        form = None
         try:
-            parser = MemoryMultipart(request.headers, bounded_stream(request, materials.MAX_TOTAL + 1024 * 1024),
-                                     max_files=20, max_fields=5, max_part_size=65536)
-            form = await parser.parse()
-            uploads = [(value.filename or "未命名", await value.read()) for key, value in form.multi_items()
-                       if isinstance(value, UploadFile)]
-            mode = form.get("extraction", "local")
+            async with multipart(request, total_limit=materials.MAX_TOTAL + 1024 * 1024,
+                                 max_files=20, max_fields=5) as form:
+                uploads = [(value.filename or "未命名", await value.read()) for key, value in form.multi_items()
+                           if isinstance(value, UploadFile)]
+                mode = form.get("extraction", "local")
             if mode not in {"local", "auto", "ai"}:
                 raise HTTPException(422, "提取方式无效。")
             catalog = field_catalog()
@@ -135,26 +118,25 @@ def register(app, get_user, allow, save_audit, rules_dir):
                     if len(jobs) >= 20 or not ai_slots.acquire(blocking=False):
                         raise HTTPException(429, "AI 正在处理其他材料，请稍后再试。")
                     job_id = secrets.token_urlsafe(24)
-                    jobs[job_id] = {"owner": user["id"], "state": "processing", "expires": time.monotonic() + 900}
+                    jobs[job_id] = {**scope(user), "state": "processing", "expires": time.monotonic() + 900}
                 background.add_task(run_ai, job_id, uploads, catalog, user, settings)
                 from fastapi.responses import JSONResponse
                 return JSONResponse({"job_id": job_id, "state": "processing"}, status_code=202)
             docs = await run_in_threadpool(materials.preview, uploads, set(catalog))
         except (materials.InputError, MultiPartException) as exc:
             raise HTTPException(422, str(exc)) from exc
-        finally:
-            if form is not None:
-                await form.close()
         return save_preview(docs, catalog, user)
 
     def commit(body, user):
         with lock:
             purge()
             draft = drafts.get(body.get("token"))
-            if not draft or draft["owner"] != user["id"]:
+            if not belongs(draft, user):
                 raise HTTPException(422, "核对任务不存在或已过期，请重新上传（有效期 10 分钟）。")
             # A repeated submission returns exactly the existing result, never another audit.
             if draft["result"] is not None:
+                for item in draft['result']['results']:
+                    audit_for_user(item['audit']['audit_id'], user)
                 return draft["result"]
             items = body.get("selections")
             if not isinstance(items, list) or not 1 <= len(items) <= 20 or any(not isinstance(i, dict) for i in items):
@@ -181,17 +163,27 @@ def register(app, get_user, allow, save_audit, rules_dir):
             if client_id and len(groups) != 1:
                 raise HTTPException(422, "关联客户档案时请合并为一次审计，或每次只提交一份材料。")
             results, errors = [], []
-            for group in groups:
+            uncertain = False
+            for index, group in enumerate(groups):
                 names = [d["name"] for d in group]
                 try:
                     dataset = materials.build_dataset(group, selections, company if mode == "merge" else {}, set(draft["catalog"]))
                     response = save_audit(dataset, user, client_id)
                     results.append({"files": names, "audit": response})
-                except (materials.InputError, HTTPException) as exc:
+                except (materials.InputError, HTTPException, AccessDenied) as exc:
                     errors.append({"files": names, "detail": exc.detail if isinstance(exc, HTTPException) else str(exc)})
+                except Exception:
+                    # Earlier groups may already be committed, and this group
+                    # may have failed after its commit. Never replay it blindly.
+                    uncertain = True
+                    errors.append({"files": names, "detail": "服务异常，无法确认本组是否已保存。请先核查历史档案，不要直接重复上传。"})
+                    errors.extend({"files": [d['name'] for d in remaining],
+                                   "detail": "前组发生服务异常，本组尚未执行。核查已保存结果后可单独上传本组。"}
+                                  for remaining in groups[index + 1:])
+                    break
             result = {"results": results, "errors": errors}
             # All-validation-failed requests can be corrected in the same review screen.
-            if results:
+            if results or uncertain:
                 draft["result"] = result
                 draft["docs"] = []
             return result
@@ -199,7 +191,7 @@ def register(app, get_user, allow, save_audit, rules_dir):
     @app.post("/api/materials/audit")
     async def audit(request: Request, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+        allow(user, "org_admin", "accountant", "teacher")
         try:
             chunks = [chunk async for chunk in bounded_stream(request, 2 * 1024 * 1024)]
             body = json.loads(b"".join(chunks))

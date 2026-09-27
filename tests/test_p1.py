@@ -102,11 +102,7 @@ class P1WebFlow(unittest.TestCase):
                     self.assertEqual(setup.status_code, 200, setup.text)
                     self.assertEqual(client.post("/api/login", json={"username": "rootadmin", "password": "platform-pass-2026"}).status_code, 200)
                     for username, role in (("teacher1", "teacher"), ("student1", "student")):
-                        response = client.post("/api/users", json={
-                            "username": username, "password": f"{username}-pass-2026",
-                            "display_name": username, "role": role, "org_id": "school-a",
-                        })
-                        self.assertEqual(response.status_code, 200, response.text)
+                        app_module.store.create_user(username, f"{username}-pass-2026", username, role, "school-a")
                     client.post("/api/logout")
 
                     self.assertEqual(client.post("/api/login", json={"username": "teacher1", "password": "teacher1-pass-2026"}).status_code, 200)
@@ -153,13 +149,9 @@ class P1WebFlow(unittest.TestCase):
                     }).status_code, 200)
                     created = {}
                     for username, role in (("orgadmin", "org_admin"), ("accountant1", "accountant"), ("accountant2", "accountant")):
-                        response = client.post("/api/users", json={
-                            "username": username, "password": f"{username}-pass-2026",
-                            "display_name": username, "role": role, "org_id": "school-a",
-                        })
-                        self.assertEqual(response.status_code, 200, response.text)
-                        created[username] = response.json()
+                        created[username] = app_module.store.create_user(username, f"{username}-pass-2026", username, role, "school-a")
                     sample = loader.load(ROOT / "samples" / "样例企业-审计材料.xlsx")
+                    self.assertEqual(client.post('/api/login', json={'username':'orgadmin','password':'orgadmin-pass-2026'}).status_code, 200)
                     customer = client.post("/api/clients", json={
                         "name": "仿真客户", "taxpayer_id": sample.company.taxpayer_id,
                         "accountant_id": created["accountant1"]["id"],

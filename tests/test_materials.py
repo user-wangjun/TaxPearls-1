@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from openpyxl import Workbook
 from src import config, engine, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from webapp.access import AccessDenied
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -142,7 +144,7 @@ class MaterialWebFlow(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_store = app_module.store
         app_module.store = Store(Path(self.temp.name) / "test.db")
-        app_module.store.create_user("admin", "material-test-2026", "测试管理", "platform_admin", "default")
+        app_module.store.create_user("admin", "material-test-2026", "测试管理", "org_admin", "default")
         self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username":"admin", "password":"material-test-2026"})
 
@@ -168,6 +170,62 @@ class MaterialWebFlow(unittest.TestCase):
         self.assertEqual(len(body["errors"]), 1)
         self.assertEqual(self.commit(draft).json(), body)
         self.assertEqual(len(self.client.get("/api/audits").json()), 1)
+
+    def test_batch_permission_failure_does_not_replay_saved_groups(self):
+        draft = self.preview([('a.xlsx',accounts()),('b.xlsx',accounts({**COMPANY,'taxpayer_id':'TEST-B'}))])
+        original = app_module.store.save_audit
+        count = 0
+        def save(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count==2:
+                raise AccessDenied('客户权限已变化。',403)
+            return original(*args,**kwargs)
+        with patch.object(app_module.store,'save_audit',side_effect=save):
+            response = self.commit(draft)
+            self.assertEqual(response.status_code,200,response.text)
+            result = response.json()
+            self.assertEqual(len(result['results']),1)
+            self.assertEqual(len(result['errors']),1)
+            self.assertEqual(self.commit(draft).json(),result)
+        self.assertEqual(count,2)
+        self.assertEqual(len(self.client.get('/api/audits').json()),1)
+
+    def test_batch_unknown_after_commit_freezes_result_and_stops_remaining(self):
+        draft = self.preview([(name+'.xlsx',accounts({**COMPANY,'taxpayer_id':'TEST-'+name})) for name in ['A','B','C']])
+        original = app_module.store.save_audit
+        count = 0
+        def save(*args, **kwargs):
+            nonlocal count
+            count += 1
+            original(*args,**kwargs)
+            if count==2:
+                raise RuntimeError('private database path and secret must not escape')
+        with patch.object(app_module.store,'save_audit',side_effect=save):
+            response = self.commit(draft)
+            self.assertEqual(response.status_code,200,response.text)
+            result = response.json()
+            self.assertEqual(len(result['results']),1)
+            self.assertEqual(len(result['errors']),2)
+            self.assertIn('无法确认',result['errors'][0]['detail'])
+            self.assertIn('尚未执行',result['errors'][1]['detail'])
+            self.assertNotIn('private',response.text)
+            self.assertEqual(self.commit(draft).json(),result)
+        self.assertEqual(count,2)
+        self.assertEqual(len(self.client.get('/api/audits').json()),2)
+
+    def test_first_group_unknown_is_not_retried_but_validation_can_be_corrected(self):
+        draft = self.preview([('a.xlsx',accounts())])
+        with patch.object(app_module.store,'save_audit',side_effect=RuntimeError('local failure')) as save:
+            first = self.commit(draft).json()
+            self.assertEqual(first['results'],[])
+            self.assertEqual(self.commit(draft).json(),first)
+            self.assertEqual(save.call_count,1)
+        other = self.preview([('no-company.xlsx',accounts(company=None))])
+        failed = self.commit(other,mode='merge',same_scope=True).json()
+        self.assertEqual(failed['results'],[])
+        fixed = self.commit(other,mode='merge',same_scope=True,company=COMPANY).json()
+        self.assertEqual(len(fixed['results']),1)
 
     def test_zip_pdf_merge_review_and_persisted_sources(self):
         draft = self.preview([("pack.zip", zip_bytes([("a.xlsx", accounts()), ("tax.pdf", (FIXTURES/"materials-text.pdf").read_bytes())]))])

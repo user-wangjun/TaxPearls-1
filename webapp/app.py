@@ -5,6 +5,7 @@ ownership, audit logs, rule switches and deterministic training/marking.
 Uploaded workbook bytes stay in memory; only normalized evidence is stored.
 """
 from __future__ import annotations
+from src import periods
 
 import base64
 from copy import deepcopy
@@ -19,19 +20,22 @@ from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Annotated, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
-from fastapi import BackgroundTasks, Cookie, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Cookie, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict, AwareDatetime
 from PIL import Image, ImageOps, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
+from webapp.uploads import multipart, single_file
 
 from src import engine, loader, render, training, sandbox_feedback
-from src import settings  # Load .env before Store and route initialization.
-from src.mailer import MailError, send_password_reset_email, send_registration_code_email
+from src import settings as _environment_settings  # noqa: F401 - Load .env before Store and route initialization.
+from src.mailer import MailError, send_password_reset_email, send_registration_code_email, send_login_code_email
 from src.models import Dataset, Rule
-from webapp import captcha, classroom
+from webapp import captcha, classroom, members, email_auth
+from webapp.access import AccessDenied
 from webapp.notifications import NotificationWorker, email_delivery_enabled
 from webapp.storage import SetupAlreadyInitialized, Store
 from webapp.login_guard import LoginGuard, RateLimiter
@@ -44,14 +48,17 @@ ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGO_SVG = ROOT / "logo" / "logo-shui-hai-shi-zhu.svg"
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_ORG_LOGO_BYTES = 512 * 1024
 MAX_NORMALIZED_LOGO_BYTES = 1024 * 1024
 MAX_ORG_LOGO_EDGE = 1200
 COOKIE_NAME = "taxpearls_session"
+EMAIL_COOKIE_NAME = "taxpearls_email_browser"
 
 @asynccontextmanager
 async def lifespan(application):
+    global store
+    if store is None:
+        store = Store()
     worker = NotificationWorker(lambda: store)
     worker.start()
     try:
@@ -63,6 +70,20 @@ async def lifespan(application):
 app = FastAPI(title="税海拾珠 · 税务风险审计", version="1.0.0", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+@app.exception_handler(AccessDenied)
+async def denied_access(_request: Request, exc: AccessDenied):
+    return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
+
+@app.middleware("http")
+async def private_api_responses(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'private, no-store'
+        response.headers.append('Vary', 'Cookie')
+    return response
+
+
 @app.exception_handler(RequestValidationError)
 async def invalid_request(_request: Request, exc: RequestValidationError):
     # Do not echo credentials/raw request data, including JSON NaN/Infinity
@@ -70,10 +91,15 @@ async def invalid_request(_request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422,content={"detail":[
         {"loc":error["loc"],"type":error["type"],"msg":error["msg"]} for error in exc.errors()
     ]},headers={"Cache-Control":"no-store"})
-store = Store()
+store: Store | None = None
 login_guard = LoginGuard()
 reset_limiter = RateLimiter({"email": (1, 15 * 60), "ip": (10, 60 * 60)})
 register_code_limiter = RateLimiter({"email": (1, 15 * 60), "ip": (10, 60 * 60)})
+register_complete_limiter = RateLimiter({"email": (10, 15 * 60), "ip": (60, 60 * 60)})
+reset_confirm_limiter = RateLimiter({"token": (5, 15 * 60), "ip": (40, 15 * 60)})
+captcha_limiter = RateLimiter({"ip": (30, 60)})
+email_verify_limiter = RateLimiter({"token": (10, 15 * 60), "ip": (60, 15 * 60)})
+email_login_limiter = RateLimiter({"email": (10, 15 * 60), "ip": (60, 15 * 60)})
 
 
 @app.get("/healthz")
@@ -104,25 +130,41 @@ class UserBody(BaseModel):
 
 
 class PasswordResetBody(BaseModel):
-    email: str
+    email: str = Field(max_length=254)
 
 
 class PasswordResetConfirmBody(BaseModel):
-    token: str
-    password: str
+    token: str = Field(max_length=512)
+    password: str = Field(max_length=128)
 
 
 class EmailStartBody(BaseModel):
-    email: str
-    captcha_id: str
-    captcha_answer: str
+    model_config = ConfigDict(extra='forbid')
+    email: str = Field(max_length=254)
+    captcha_id: str = Field(max_length=64)
+    captcha_answer: str = Field(max_length=16)
+    purpose: Literal['register','login'] = 'register'
+    invite_code: str = Field(default='',max_length=128)
+
+
+class EmailMagicBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    token: str = Field(max_length=128)
+
+
+class EmailLoginBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    email: str = Field(max_length=254)
+    code: str = Field(max_length=16)
 
 
 class RegisterCompleteBody(BaseModel):
-    email: str
-    code: str
-    invite_code: str
-    password: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(max_length=254)
+    code: str = Field(max_length=16)
+    invite_code: str = Field(max_length=128)
+    password: str = Field(max_length=128)
+    email_proof: str = Field(default='',max_length=128)
 
 
 class InviteBody(BaseModel):
@@ -216,20 +258,9 @@ def _allow(user: dict[str, Any], *roles: str) -> None:
         raise HTTPException(status_code=403, detail="当前角色无权执行此操作。")
 
 
-def _can_access_audit(user: dict[str, Any], entry: dict[str, Any]) -> bool:
-    if user["role"] == "platform_admin":
-        return True
-    if user["org_id"] != entry["org_id"]:
-        return False
-    if user["role"] != "accountant":
-        return True
-    client = store.get_client(entry["client_id"]) if entry.get("client_id") else None
-    return bool(client and client.get("accountant_id") == user["id"])
-
-
 def _audit_or_404(audit_id: str, user: dict[str, Any]) -> dict[str, Any]:
-    entry = store.get_audit(audit_id)
-    if not entry or not _can_access_audit(user, entry):
+    entry = store.get_audit_for_user(audit_id, user)
+    if not entry:
         raise HTTPException(status_code=404, detail="审计结果不存在或无权访问。")
     return entry
 
@@ -323,7 +354,7 @@ def _audit_rules(dataset: Dataset, enabled: set[str] | None = None) -> list[Any]
     An interval crossing a version boundary needs a split-period audit; choosing
     a version by the end date would silently apply it to earlier transactions.
     """
-    period = loader._parse_period(dataset.company.period, "审计所属期")
+    period = periods.parse_period(dataset.company.period, "审计所属期")
     histories = store.rule_versions()
     selected = []
     for base in engine.load_rules(RULES_DIR):
@@ -423,9 +454,8 @@ def _trial_payload(finding: Any, audit_id: str) -> dict[str, Any]:
 
 def _is_synthetic_dataset(dataset: Dataset) -> bool:
     """Use one definition for teaching-data checks across audit and training."""
-    name = dataset.company.name
-    taxpayer_id = dataset.company.taxpayer_id.upper()
-    return "仿真" in name or "纯合成测试" in name or "TEST" in taxpayer_id
+    from webapp.access import is_teaching_dataset
+    return is_teaching_dataset(dataset)
 
 
 def _metrics_list(dataset: Dataset) -> list[dict[str, str]]:
@@ -450,6 +480,15 @@ def _result(entry: dict[str, Any]) -> dict[str, Any]:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
+
+@app.get("/p/{code}")
+def member_invitation_landing(code: str) -> FileResponse:
+    # This route never authenticates or reveals an institution. Full-hash
+    # validation happens only after email proof in the registration transaction.
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html",
+                        headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer",
+                                 "X-Robots-Tag":"noindex, nofollow"})
 
 
 @app.get("/logo")
@@ -482,35 +521,29 @@ def classroom_script() -> FileResponse:
     return FileResponse(STATIC_DIR / "classroom.js", media_type="text/javascript")
 
 
+@app.get("/mistake-book.js")
+def mistake_book_script() -> FileResponse:
+    return FileResponse(STATIC_DIR / "mistake-book.js", media_type="text/javascript")
+
+
+@app.get("/console.js")
+def console_script():
+    return FileResponse(STATIC_DIR / "console.js", media_type="text/javascript")
+
+
 @app.get("/workspace.css")
 def workspace_styles() -> FileResponse:
     return FileResponse(STATIC_DIR / "workspace.css", media_type="text/css")
 
 
 @app.get("/api/dashboard")
-def dashboard(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
+def dashboard(session: str | None = Cookie(default=None, alias=COOKIE_NAME),
+              company: str | None = Query(default=None, max_length=200),
+              page: int = Query(default=1, ge=1), page_size: int = Query(default=24, ge=1, le=100)):
+    from webapp.dashboard import collect
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
-    records = []
-    seen = set()
-    history = store.list_audits(user)
-    for row in history:
-        key = (row["taxpayer_id"] or row["company_name"], row["period"])
-        if key in seen:
-            continue
-        seen.add(key)
-        entry = store.get_audit(row["id"])
-        if not entry:
-            continue
-        records.append({**row, "metrics": {
-            name: {"value": str(metric.value), "source": metric.source}
-            for name, metric in entry["dataset"].metrics.items()
-        }, "risks": [{"id": f.rule.id, "name": f.rule.name,
-                        "severity": f.rule.severity, "category": f.rule.category,
-                        "status": f.status, "reason": f.skip_reason}
-                       for f in entry["findings"] if f.status != "pass"]})
-    clients = [] if user["role"] == "teacher" else store.list_clients(user)
-    return {"records": records, "history": history, "clients": clients}
+    _allow(user, "org_admin", "accountant", "teacher")
+    return collect(store, user, company, page, page_size)
 
 
 from webapp.org_reports import register as register_org_reports
@@ -546,7 +579,7 @@ class GraphQuestion(BaseModel):
 def _graph_for_user(user, audit_id):
     entry = None
     if audit_id:
-        _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+        _allow(user, "org_admin", "accountant", "teacher")
         entry = _audit_or_404(audit_id, user)
     return build_graph(_effective_rules(), entry)
 
@@ -565,14 +598,17 @@ def knowledge_ask(body: GraphQuestion,
                   session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
     graph = _graph_for_user(user, body.audit_id)
-    return ask_graph(graph, body.node_id, body.question)
+    result = ask_graph(graph, body.node_id, body.question)
+    if body.audit_id:
+        _audit_or_404(body.audit_id, user)
+    return result
 
 
 @app.post("/api/audits/{audit_id}/findings/{rule_id}/interpretation")
 def finding_interpretation(audit_id: str, rule_id: str,
                            session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     entry = _audit_or_404(audit_id, user)
     finding = next((item for item in entry["findings"] if item.rule.id == rule_id), None)
     if not finding:
@@ -582,14 +618,16 @@ def finding_interpretation(audit_id: str, rule_id: str,
     evidence_hash = finding_evidence_hash(finding)
     cached = store.get_finding_interpretation(audit_id, rule_id, evidence_hash)
     if cached:
+        _audit_or_404(audit_id, user)
         store.log(user, "interpret_finding", "audit", audit_id,
                   f"rule={rule_id};cache=hit;model={cached['model']}")
         return cached
     result = interpret_finding(finding)
+    _audit_or_404(audit_id, user)
     if result["evidence_hash"] != evidence_hash:
         raise HTTPException(status_code=502, detail="模型解读与当前审计证据版本不一致。")
     saved = store.save_finding_interpretation(
-        audit_id, rule_id, evidence_hash, result, user["id"],
+        audit_id, rule_id, evidence_hash, result, user,
     )
     store.log(user, "interpret_finding", "audit", audit_id,
               f"rule={rule_id};cache=miss;model={result['model']}")
@@ -600,19 +638,21 @@ def finding_interpretation(audit_id: str, rule_id: str,
 def audit_narrative(audit_id: str,
                     session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     entry = _audit_or_404(audit_id, user)
     findings = entry["findings"]
     evidence_hash = audit_narrative_hash(findings)
     cached = store.get_audit_narrative(audit_id, evidence_hash)
     if cached:
+        _audit_or_404(audit_id, user)
         store.log(user, "generate_audit_narrative", "audit", audit_id,
                   f"cache=hit;model={cached['model']}")
         return cached
     result = generate_audit_narrative(findings)
+    _audit_or_404(audit_id, user)
     if result["evidence_hash"] != evidence_hash:
         raise HTTPException(status_code=502, detail="模型总体结论与当前审计证据版本不一致。")
-    saved = store.save_audit_narrative(audit_id, evidence_hash, result, user["id"])
+    saved = store.save_audit_narrative(audit_id, evidence_hash, result, user)
     store.log(user, "generate_audit_narrative", "audit", audit_id,
               f"cache=miss;model={result['model']}")
     return {**saved, "cached": False}
@@ -626,8 +666,8 @@ def graph_script():
 @app.post("/api/setup")
 def setup(body: SetupBody) -> dict[str, Any]:
     try:
-        user = store.create_initial_admin(body.username, body.password, body.display_name.strip() or body.username,
-                                          body.org_id, body.email)
+        store.create_initial_admin(body.username, body.password, body.display_name.strip() or body.username,
+                                   body.org_id, body.email)
     except SetupAlreadyInitialized:
         raise HTTPException(status_code=409, detail="系统已初始化。") from None
     except ValueError as exc:
@@ -636,7 +676,6 @@ def setup(body: SetupBody) -> dict[str, Any]:
         if "users.email" in str(exc):
             raise HTTPException(status_code=409, detail="该邮箱已被占用，请换用其他邮箱。") from None
         raise HTTPException(status_code=409, detail="账号与现有数据冲突。") from None
-    store.log(user, "setup", "system", "initial")
     return {"ok": True}
 
 
@@ -672,90 +711,161 @@ def logout(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> Res
     store.logout(session)
     response = JSONResponse({"ok": True})
     response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(EMAIL_COOKIE_NAME)
+    return response
+
+
+def _email_public_base(request: Request) -> str:
+    """Do not send secrets to an attacker-controlled Host header."""
+    configured = os.getenv('TAXPEARLS_PUBLIC_BASE_URL','').strip().rstrip('/')
+    value = configured or str(request.base_url).rstrip('/')
+    try:
+        parsed = urlsplit(value)
+        local = parsed.hostname in {'localhost','127.0.0.1','::1'}
+        valid = (parsed.scheme in {'http','https'} and bool(parsed.hostname)
+                 and not parsed.username and not parsed.password and parsed.path in {'','/'}
+                 and not parsed.query and not parsed.fragment and '\\' not in value
+                 and not any(ord(ch)<=32 for ch in value) and (parsed.port is None or 1<=parsed.port<=65535)
+                 and (parsed.scheme=='https' or local) and (bool(configured) or local))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise HTTPException(503,'请配置可信的 TAXPEARLS_PUBLIC_BASE_URL（生产环境须 HTTPS）。')
+    return value
+
+
+def _email_browser_response(content, browser):
+    response = JSONResponse(content)
+    response.set_cookie(EMAIL_COOKIE_NAME,browser,max_age=30*60,httponly=True,samesite='strict',
+                        secure=os.environ.get('TAXPEARLS_COOKIE_SECURE')=='1')
+    return response
+
+
+def _email_login_response(user, token):
+    response=JSONResponse({'user':user,'purpose':'login'})
+    response.set_cookie(COOKIE_NAME,token,max_age=12*3600,httponly=True,samesite='strict',
+                        secure=os.environ.get('TAXPEARLS_COOKIE_SECURE')=='1')
     return response
 
 
 @app.post("/api/auth/password/reset")
-def password_reset(body: PasswordResetBody, request: Request) -> dict[str, Any]:
+def password_reset(body: PasswordResetBody, request: Request) -> Response:
     """申请重置邮件。防枚举：无论邮箱是否存在，成功响应完全一致。"""
     ip = request.client.host if request.client else "unknown"
     if not reset_limiter.allow(email=body.email, ip=ip):
         return JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
-    token = store.create_password_reset(body.email)
-    if token:
-        base = (os.getenv("TAXPEARLS_PUBLIC_BASE_URL", "").strip().rstrip("/")
-                or str(request.base_url).rstrip("/"))
+    base = _email_public_base(request)
+    browser = email_auth.browser_secret(request.cookies.get(EMAIL_COOKIE_NAME))
+    try:
+        delivery = email_auth.issue(store,body.email,'reset',browser)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from None
+    if delivery:
         try:
-            send_password_reset_email(to=body.email.strip().lower(), reset_url=f"{base}/?reset={token}")
-        except MailError as exc:
+            send_password_reset_email(to=delivery['email'], reset_url=f"{base}/#email={delivery['token']}")
+        except MailError:
+            email_auth.revoke_delivery(store,delivery['token'])
             store.log(None, "password_reset_failed", "email_hash",
-                      login_guard.fingerprint(body.email.strip().lower()), str(exc)[:200])
-            raise HTTPException(status_code=502, detail="重置邮件发送失败，请稍后重试。") from None
-        # 留痕口径：发送事件入审计日志，邮箱只以哈希出现，不落明文。
-        store.log(None, "password_reset_sent", "email_hash",
-                  login_guard.fingerprint(body.email.strip().lower()),
-                  f"ip_hash={login_guard.fingerprint(ip)}")
-    return {"message": "若该邮箱已注册，重置邮件已发送，请查收（含垃圾箱）。"}
+                      login_guard.fingerprint(delivery['email']), 'delivery_error')
+        else:
+            store.log(None, "password_reset_sent", "email_hash",
+                      login_guard.fingerprint(delivery['email']),f"ip_hash={login_guard.fingerprint(ip)}")
+    return _email_browser_response({"message": "若该邮箱可用，重置邮件将发送至该邮箱。请在发起请求的浏览器打开，10 分钟内有效；未收到可稍后重新申请。"},browser)
 
 
 @app.post("/api/auth/password/reset/confirm")
-def password_reset_confirm(body: PasswordResetConfirmBody) -> dict[str, Any]:
+def password_reset_confirm(body: PasswordResetConfirmBody, request: Request) -> dict[str, Any]:
+    ip = request.client.host if request.client else "unknown"
+    if not reset_confirm_limiter.allow(token=body.token, ip=ip):
+        return JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
     try:
-        user = store.redeem_password_reset(body.token, body.password)
+        email_auth.reset_password(store,body.token,body.password,request.cookies.get(EMAIL_COOKIE_NAME,''))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    store.log(user, "password_reset", "user", user["id"])
     return {"message": "密码已重置，请使用新密码登录。"}
 
 
 @app.get("/api/auth/captcha")
-def auth_captcha() -> dict[str, str]:
+def auth_captcha(request: Request) -> dict[str, str]:
     """签发图片人机验证码（PNG data URL）。"""
-    return captcha.issue()
+    ip = request.client.host if request.client else "unknown"
+    if not captcha_limiter.allow(ip=ip):
+        return JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
+    try:
+        return captcha.issue()
+    except captcha.CaptchaCapacityError:
+        return JSONResponse(status_code=503, content={"detail": "验证码容量暂满，请稍后重试。"},
+                            headers={"Retry-After": "60"})
 
 
 @app.post("/api/auth/email/start")
 def email_start(body: EmailStartBody, request: Request) -> dict[str, Any]:
-    """注册第一步：人机验证 + 发送邮箱验证码。
-
-    - 人机验证挡的是「发送验证码」这个可被滥用的动作
-    - 邮箱已注册时不发信，提示直接登录
-    - 限频：单邮箱 15 分钟 1 次 / 单 IP 每小时 10 次
-    """
+    """验证码/魔术链接共用一份绑定请求，注册或邮箱登录均需图片挑战。"""
     ip = request.client.host if request.client else "unknown"
     if not captcha.verify(body.captcha_id, body.captcha_answer):
         return JSONResponse(status_code=422, content={"detail": "人机验证不正确，请重试。"})
     email = body.email.strip().lower()
     if not register_code_limiter.allow(email=email, ip=ip):
         return JSONResponse(status_code=429, content={"detail": "发送过于频繁，请 15 分钟后再试。"})
-    if store.get_user_by_email(email):
-        return {"message": "该邮箱已注册，请直接登录；忘记密码可用登录页的「忘记密码？」找回。",
-                "exists": True}
-    code = store.create_register_code(email)
-    if not code:
-        return JSONResponse(status_code=422, content={"detail": "邮箱格式不正确。"})
-    base = (os.getenv("TAXPEARLS_PUBLIC_BASE_URL", "").strip().rstrip("/")
-            or str(request.base_url).rstrip("/"))
-    signup_url = f"{base}/?email={email}&code={code}"
+    base = _email_public_base(request)
+    browser = email_auth.browser_secret(request.cookies.get(EMAIL_COOKIE_NAME))
     try:
-        send_registration_code_email(to=email, code=code, signup_url=signup_url)
-    except MailError as exc:
-        store.log(None, "register_code_failed", "email_hash",
-                  login_guard.fingerprint(email), str(exc)[:200])
-        raise HTTPException(status_code=502, detail="验证邮件发送失败，请稍后重试。") from None
-    store.log(None, "register_code_sent", "email_hash",
-              login_guard.fingerprint(email), f"ip_hash={login_guard.fingerprint(ip)}")
-    return {"message": "验证码已发送，10 分钟内有效；输错 5 次将作废。", "exists": False}
+        delivery=email_auth.issue(store,email,body.purpose,browser,invite_code=body.invite_code)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from None
+    if not delivery and body.purpose=='register':
+        return _email_browser_response({'message':'该邮箱已注册，请直接登录或申请找回密码。','exists':True},browser)
+    if delivery:
+        try:
+            sender=send_registration_code_email if body.purpose=='register' else send_login_code_email
+            sender(to=email,code=delivery['code'],signup_url=f"{base}/#email={delivery['token']}")
+        except MailError:
+            email_auth.revoke_delivery(store,delivery['token'])
+            store.log(None,'email_delivery_failed','email_hash',login_guard.fingerprint(email),'delivery_error')
+            if body.purpose=='register':
+                raise HTTPException(502,'验证邮件发送失败，请稍后重试。') from None
+        else:
+            store.log(None,'email_verification_sent','email_hash',login_guard.fingerprint(email),
+                      f'purpose={body.purpose};ip_hash={login_guard.fingerprint(ip)}')
+    message=('若该邮箱可用，验证邮件将发送至该邮箱。' if body.purpose=='login' else '验证邮件已发送。')
+    return _email_browser_response({'message':message+'请在发起请求的浏览器输入验证码或打开邮件链接；10 分钟内有效，输错 5 次作废。','exists':False},browser)
+
+
+@app.post('/api/auth/email/verify')
+def email_verify(body: EmailMagicBody, request: Request) -> Response:
+    ip=request.client.host if request.client else 'unknown'
+    if not email_verify_limiter.allow(token=body.token,ip=ip):
+        return JSONResponse(status_code=429,content={'detail':'请求过于频繁，请稍后再试。'})
+    try:
+        result=email_auth.redeem_magic(store,body.token,request.cookies.get(EMAIL_COOKIE_NAME,''))
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from None
+    if result['purpose']=='login':
+        return _email_login_response(result['user'],result['session'])
+    return JSONResponse(result)
+
+
+@app.post('/api/auth/email/login')
+def email_login(body: EmailLoginBody, request: Request) -> Response:
+    ip=request.client.host if request.client else 'unknown'
+    if not email_login_limiter.allow(email=body.email,ip=ip):
+        return JSONResponse(status_code=429,content={'detail':'请求过于频繁，请稍后再试。'})
+    try:
+        user,token=email_auth.login_with_code(store,body.email,body.code,request.cookies.get(EMAIL_COOKIE_NAME,''))
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from None
+    return _email_login_response(user,token)
 
 
 @app.post("/api/register/complete")
-def register_complete(body: RegisterCompleteBody) -> Response:
-    """开户最后一步：邮箱验证码 + 创始码在单事务内核验并建号。
-
-    第一层（创始码）：建机构，注册者成为 org_admin。第二层（机构链接）为第二轮实现。
-    """
+def register_complete(body: RegisterCompleteBody, request: Request) -> Response:
+    """邮箱验证与完整邀请凭证同事务；角色/机构来自凭证，不接受客户端指定。"""
+    ip = request.client.host if request.client else "unknown"
+    if not register_complete_limiter.allow(email=body.email, ip=ip):
+        return JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
     try:
-        user, token = store.register_with_code(body.email, body.code, body.invite_code, body.password)
+        user, token = store.register_with_code(body.email, body.code, body.invite_code, body.password,
+                                             browser_session=request.cookies.get(EMAIL_COOKIE_NAME,''),email_proof=body.email_proof)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except sqlite3.IntegrityError as exc:
@@ -780,8 +890,6 @@ def create_invite(body: InviteBody, session: str | None = Cookie(default=None, a
                                           body.bound_email, body.expires_days)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    store.log(actor, "invite_created", "invite", invite["code"][:4] + "…",
-              f"org={body.org_name};seats={body.seats}")
     return invite
 
 
@@ -789,7 +897,7 @@ def create_invite(body: InviteBody, session: str | None = Cookie(default=None, a
 def list_invites(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     actor = _user(session)
     _allow(actor, "platform_admin")
-    return store.list_invite_codes()
+    return store.list_invite_codes(actor=actor)
 
 
 @app.get("/api/me")
@@ -800,7 +908,7 @@ def me(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[st
 @app.get("/api/notifications/preferences")
 def notification_preferences(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     account = store.get_user(user["id"])
     return {**store.notification_preferences(user["id"]), "has_email": bool(account and account.get("email")),
             "delivery_enabled": email_delivery_enabled()}
@@ -813,8 +921,6 @@ def _save_notification_preferences(user: dict[str, Any], target_id: str, body: N
         raise HTTPException(403, str(exc)) from None
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    store.log(user, "notification_preferences", "user", target_id,
-              f"audit_completed={body.audit_completed};high_risk={body.high_risk};email={body.email_enabled}")
     return saved
 
 
@@ -822,7 +928,7 @@ def _save_notification_preferences(user: dict[str, Any], target_id: str, body: N
 def update_notification_preferences(body: NotificationPreferencesBody,
         session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     return _save_notification_preferences(user, user["id"], body)
 
 
@@ -830,11 +936,7 @@ def update_notification_preferences(body: NotificationPreferencesBody,
 def notification_recipients(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
     _allow(user, "platform_admin", "org_admin")
-    members = store.list_users(None if user["role"] == "platform_admin" else user["org_id"])
-    return [{"id": member["id"], "display_name": member["display_name"], "org_id": member["org_id"],
-             "role": member["role"], "has_email": bool(member.get("email")),
-             **store.notification_preferences(member["id"])}
-            for member in members if member["active"] and member["role"] != "student"]
+    return store.list_notification_recipients(user)
 
 
 @app.put("/api/notifications/recipients/{user_id}")
@@ -848,49 +950,49 @@ def update_notification_recipient(user_id: str, body: NotificationPreferencesBod
 @app.get("/api/notifications")
 def notifications(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     return store.list_notifications(user)
 
 
 @app.put("/api/notifications/{notification_id}/read")
 def read_notification(notification_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     if not store.mark_notification_read(user, notification_id):
         raise HTTPException(404, "通知不存在或无权查看。")
     return {"id": notification_id, "read": True}
 
 
 @app.post("/api/notifications/{notification_id}/retry")
-def retry_notification(notification_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
+def retry_notification(notification_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME),
+                       channel: str = Query(default='email',max_length=32)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     try:
-        authorized = store.retry_notification_delivery(user, notification_id)
+        authorized = store.retry_notification_delivery(user, notification_id,channel=channel)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from None
     if not authorized:
         raise HTTPException(404, "通知不存在或无权访问。")
-    store.log(user, "notification_retry", "notification", notification_id, "manual retry")
-    return {"id": notification_id, "email_status": "pending"}
+    return {"id": notification_id,"channel":channel,"status":"pending",**({'email_status':'pending'} if channel=='email' else {})}
 
 
 @app.get("/api/users")
 def users(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
     _allow(user, "platform_admin", "org_admin")
-    return store.list_users(None if user["role"] == "platform_admin" else user["org_id"])
+    return store.list_users(None if user["role"] == "platform_admin" else user["org_id"], actor=user)
 
 
 @app.post("/api/users")
 def create_user(body: UserBody, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     actor = _user(session)
-    _allow(actor, "platform_admin", "org_admin")
+    _allow(actor, "org_admin")
     org_id = body.org_id or actor["org_id"]
     if actor["role"] == "org_admin" and (body.role != "accountant" or org_id != actor["org_id"]):
         raise HTTPException(status_code=403, detail="机构管理员只能创建本机构会计账号。")
     try:
-        created = store.create_user(body.username, body.password, body.display_name, body.role, org_id, body.email)
+        created = store.create_user(body.username, body.password, body.display_name, body.role, org_id, body.email, actor=actor)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except sqlite3.IntegrityError as exc:
@@ -901,21 +1003,20 @@ def create_user(body: UserBody, session: str | None = Cookie(default=None, alias
         if "users.role" in str(exc):
             raise HTTPException(status_code=409, detail="平台管理员已存在。") from None
         raise HTTPException(status_code=409, detail="账号与现有数据冲突。") from None
-    store.log(actor, "create_user", "user", created["id"], created["role"])
     return created
 
 
 @app.get("/api/clients")
 def clients(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "platform_admin")
+    _allow(user, "org_admin", "accountant")
     return store.list_clients(user)
 
 
 @app.post("/api/clients")
 def create_client(body: ClientBody, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "org_admin", "platform_admin")
+    _allow(user, "org_admin")
     name, taxpayer_id = body.name.strip(), body.taxpayer_id.strip()
     if not name or not taxpayer_id:
         raise HTTPException(status_code=422, detail="企业名称和纳税人识别号不能为空。")
@@ -924,37 +1025,34 @@ def create_client(body: ClientBody, session: str | None = Cookie(default=None, a
         if not accountant or accountant["role"] != "accountant" or accountant["org_id"] != user["org_id"]:
             raise HTTPException(status_code=422, detail="负责人必须是本机构会计。")
     client = store.upsert_client(user, name, taxpayer_id, body.accountant_id)
-    store.log(user, "upsert_client", "client", client["id"])
     return client
 
 
 @app.post("/api/audit")
-async def audit(
-    file: UploadFile = File(...), client_id: str | None = Form(default=None),
-    session: str | None = Cookie(default=None, alias=COOKIE_NAME),
-) -> Response:
+async def audit(request: Request, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> Response:
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
-    if file.filename is None or not file.filename.lower().endswith(".xlsx"):
-        return _err(422, "仅支持 .xlsx 格式的审计材料（Excel 工作簿）。请使用标准模板导出。")
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        return _err(422, "文件过大：审计材料不得超过 10MB。")
-    if not data:
-        return _err(422, "上传文件为空。")
+    _allow(user, "org_admin", "accountant", "teacher")
+    async with multipart(request) as form:
+        file = single_file(form)
+        if not file.filename or not file.filename.lower().endswith(".xlsx"):
+            return _err(422, "仅支持 .xlsx 格式的审计材料。")
+        client_id = form.get("client_id") or None
+        if client_id is not None and (not isinstance(client_id, str) or len(client_id) > 64):
+            return _err(422, "客户档案编号格式错误。")
+        data = await file.read()
     try:
-        dataset = loader.load_bytes(data)
+        dataset = await run_in_threadpool(loader.load_bytes, data)
     except loader.InputError as exc:
         return _err(422, f"审计材料不符合模板要求：{exc}")
-    finally:
-        data = b""
-    return JSONResponse(_save_audit(dataset, user, client_id))
+    return JSONResponse(await run_in_threadpool(_save_audit, dataset, user, client_id))
 
 
 def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = None,
                 *, frozen_rules: list[Rule] | None = None, exercise_metadata: dict | None = None) -> dict[str, Any]:
     if user["role"] == "teacher" and not _is_synthetic_dataset(dataset):
         raise HTTPException(403, "教师只能导入明确标记为仿真样例的教学数据，严禁使用真实企业账套。")
+    if user['role'] == 'teacher' and client_id is not None:
+        raise HTTPException(403, "教师备课案例不能关联客户档案。")
     if client_id:
         client = store.get_client(client_id)
         if not client or client["org_id"] != user["org_id"]:
@@ -963,9 +1061,6 @@ def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = 
             raise HTTPException(403, "会计只能审计自己负责的客户。")
         if client["taxpayer_id"] != dataset.company.taxpayer_id:
             raise HTTPException(422, "审计材料中的纳税人识别号与所选客户档案不一致。")
-    elif user["role"] in {"org_admin", "accountant"}:
-        assigned = user["id"] if user["role"] == "accountant" else None
-        client_id = store.upsert_client(user, dataset.company.name, dataset.company.taxpayer_id, assigned)["id"]
     try:
         enabled = store.enabled_rule_ids()
         rules = _audit_rules(dataset, enabled) if frozen_rules is None else frozen_rules
@@ -983,35 +1078,35 @@ def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = 
     snapshot = build_snapshot({"id": audit_id, "org_id": user["org_id"], "audited_at": when,
                                "dataset": dataset, "findings": findings}, _org_branding(user["org_id"]))
     store.save_audit(audit_id, user, client_id, dataset, findings, vm["summary"], when,
-                     report_snapshot=snapshot, exercise_metadata=exercise_metadata)
-    store.log(user, "create_audit", "audit", audit_id, f"{dataset.company.name}; rules={len(findings)}")
+                     report_snapshot=snapshot, exercise_metadata=exercise_metadata, create_client=True)
     entry = store.get_audit(audit_id)
     assert entry is not None
     return _result(entry)
 
 
 from webapp.material_upload import register as register_material_upload
-register_material_upload(app, _user, _allow, _save_audit, RULES_DIR)
+register_material_upload(app, _user, _allow, _save_audit, RULES_DIR, _audit_or_404)
 
 from webapp.exercises import register as register_exercises
 register_exercises(app, lambda: store, _user, _allow, _audit_or_404, lambda data, enabled: _audit_rules(data,enabled),
                    _save_audit, _trial_payload, COOKIE_NAME)
 classroom.register(app,lambda: store,_user,_allow,_is_synthetic_dataset,COOKIE_NAME)
+from webapp.mistake_book import register as register_mistake_book
+register_mistake_book(app,lambda: store,_user,_allow,COOKIE_NAME)
+members.register(app,lambda: store,_user,COOKIE_NAME)
 
 
 @app.get("/api/audits")
 def audits(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
-    if user["role"] == "student":
-        raise HTTPException(status_code=403, detail="学生不能浏览审计档案。")
+    _allow(user, "org_admin", "accountant", "teacher")
     return store.list_audits(user)
 
 
 @app.get("/api/audits/{audit_id}")
 def audit_detail(audit_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    if user["role"] == "student":
-        raise HTTPException(status_code=403, detail="学生不能浏览审计档案。")
+    _allow(user, "org_admin", "accountant", "teacher")
     entry = _audit_or_404(audit_id, user)
     store.log(user, "view_audit", "audit", audit_id)
     return _result(entry)
@@ -1023,9 +1118,9 @@ def audit_changes(audit_id: str, baseline_id: str | None = None,
     from src import risk_changes
 
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     current = _audit_or_404(audit_id, user)
-    candidates = risk_changes.baseline_candidates(store.audit_history_for_comparison(current), current, latest_only=False)
+    candidates = risk_changes.baseline_candidates(store.audit_history_for_comparison(current, user), current, latest_only=False)
     choices = [{key: row[key] for key in ("id", "period", "audited_at")} for row in candidates]
     if baseline_id:
         # Check access before identity/period validation; do not reveal foreign IDs.
@@ -1051,9 +1146,7 @@ def _archived_report(entry, user, version=None):
         if version is None:
             narrative = store.get_audit_narrative(entry["id"], audit_narrative_hash(entry["findings"]))
             snapshot = build_snapshot(entry, _org_branding(entry["org_id"]), narrative)
-            version, created = store.archive_report(entry["id"], user, snapshot)
-            if created:
-                store.log(user, "archive_report", "audit", entry["id"], f"version={version}")
+            version, _ = store.archive_report(entry["id"], user, snapshot)
         result = store.get_report_version(entry["id"], version)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from None
@@ -1069,7 +1162,7 @@ def archive_search(q: str = Query(default="", max_length=120), period: str = Que
                    page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=1, le=100),
                    session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "审计日期起始日不能晚于截止日。")
     return store.search_audits(user, q.strip(), period.strip(), date_from.isoformat() if date_from else None,
@@ -1079,7 +1172,7 @@ def archive_search(q: str = Query(default="", max_length=120), period: str = Que
 @app.get("/api/audits/{audit_id}/report-versions")
 def report_versions(audit_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     _audit_or_404(audit_id, user)
     try:
         return store.report_versions(audit_id)
@@ -1090,7 +1183,7 @@ def report_versions(audit_id: str, session: str | None = Cookie(default=None, al
 @app.post("/api/audits/{audit_id}/report-versions")
 def archive_current_report(audit_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     result = _archived_report(_audit_or_404(audit_id, user), user)
     return {key: result[key] for key in ("version", "html_sha256", "content_sha256", "created_at", "manifest")}
 
@@ -1102,7 +1195,7 @@ def report(
     version: int | None = Query(default=None, ge=1),
 ) -> Any:
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     if user["role"] == "accountant" and not confirm:
         raise HTTPException(status_code=409, detail="会计导出需二次确认，请确认报告用途后重试。")
     entry = _audit_or_404(audit_id, user)
@@ -1114,7 +1207,7 @@ def report(
             os.close(fd)
             try:
                 render.export_pdf(archived["html"], tmp, report_no=manifest["report_no"], footer_text=manifest["footer_text"])
-                archived = store.attach_report_pdf(audit_id, archived["version"], Path(tmp).read_bytes())
+                archived = store.attach_report_pdf(audit_id, archived["version"], Path(tmp).read_bytes(), actor=user)
             finally:
                 Path(tmp).unlink(missing_ok=True)
     except RuntimeError as exc:
@@ -1124,6 +1217,7 @@ def report(
     short = _safe_filename_component(entry["company_name"].replace("（仿真样例）", "")[:12])
     title = _safe_filename_component(manifest["report_title"])
     pdf_name = f"{title}-{short}-{entry['audited_at'][:10].replace('-', '')}-v{archived['version']}.pdf"
+    _audit_or_404(audit_id, user)
     store.log(user, "export_report", "audit", audit_id, f"version={archived['version']}")
     return Response(content=archived["pdf_bytes"], media_type="application/pdf", headers={
         "Content-Disposition": "attachment; filename*=UTF-8''" + quote(pdf_name),
@@ -1135,9 +1229,10 @@ def report(
 def report_html(audit_id: str, session: str | None = Cookie(default=None, alias=COOKIE_NAME),
                 version: int | None = Query(default=None, ge=1)) -> Response:
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher", "platform_admin")
+    _allow(user, "org_admin", "accountant", "teacher")
     entry = _audit_or_404(audit_id, user)
     archived = _archived_report(entry, user, version)
+    _audit_or_404(audit_id, user)
     store.log(user, "view_report", "audit", audit_id, f"version={archived['version']}")
     return Response(content=archived["html"], media_type="text/html", headers={
         "X-TaxPearls-Report-Version": str(archived["version"]), "X-TaxPearls-SHA256": archived["html_sha256"],
@@ -1147,7 +1242,8 @@ def report_html(audit_id: str, session: str | None = Cookie(default=None, alias=
 @app.get("/api/org/settings")
 def get_org_settings(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    return store.get_org_settings(user["org_id"])
+    _allow(user, "org_admin", "accountant", "teacher", "student")
+    return store.get_org_settings(user["org_id"], actor=user)
 
 
 @app.put("/api/org/settings")
@@ -1156,22 +1252,21 @@ def put_org_settings(
     session: str | None = Cookie(default=None, alias=COOKIE_NAME),
 ) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "org_admin", "platform_admin")
+    _allow(user, "org_admin")
     try:
         saved = store.update_org_settings(
-            user["org_id"], body.display_name, body.report_title, body.footer_text
+            user["org_id"], body.display_name, body.report_title, body.footer_text, actor=user
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    store.log(user, "update_org_settings", "org", user["org_id"],
-              f"title={saved['report_title']}")
     return saved
 
 
 @app.get("/api/org/logo")
 def get_org_logo(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> Response:
     user = _user(session)
-    logo = store.get_org_logo(user["org_id"])
+    _allow(user, "org_admin", "accountant", "teacher", "student")
+    logo = store.get_org_logo(user["org_id"], actor=user)
     if not logo:
         raise HTTPException(status_code=404, detail="当前机构尚未配置 Logo。")
     return Response(
@@ -1182,29 +1277,28 @@ def get_org_logo(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) 
 
 @app.post("/api/org/logo")
 async def put_org_logo(
-    file: UploadFile = File(...),
+    request: Request,
     session: str | None = Cookie(default=None, alias=COOKIE_NAME),
 ) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "org_admin", "platform_admin")
-    content = await file.read(MAX_ORG_LOGO_BYTES + 1)
+    _allow(user, "org_admin")
+    async with multipart(request, file_limit=MAX_ORG_LOGO_BYTES, max_fields=0) as form:
+        content = await single_file(form).read()
     try:
         mime, normalized = _normalize_org_logo(content)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     finally:
         content = b""
-    saved = store.update_org_logo(user["org_id"], mime, normalized)
-    store.log(user, "update_org_logo", "org", user["org_id"], f"mime={mime}; bytes={len(normalized)}")
+    saved = store.update_org_logo(user["org_id"], mime, normalized, actor=user)
     return saved
 
 
 @app.delete("/api/org/logo")
 def delete_org_logo(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "org_admin", "platform_admin")
-    saved = store.clear_org_logo(user["org_id"])
-    store.log(user, "delete_org_logo", "org", user["org_id"])
+    _allow(user, "org_admin")
+    saved = store.clear_org_logo(user["org_id"], actor=user)
     return saved
 
 
@@ -1236,11 +1330,7 @@ def rule_state(rule_id: str, body: RuleStateBody,
     valid = {rule.id for rule in _effective_rules()}
     if rule_id not in valid:
         raise HTTPException(status_code=404, detail="规则不存在。")
-    if store.enabled_rule_ids() is None:
-        for existing in valid:
-            store.set_rule_enabled(existing, True, user["id"])
-    store.set_rule_enabled(rule_id, body.enabled, user["id"])
-    store.log(user, "set_rule_state", "rule", rule_id, f"enabled={body.enabled}")
+    store.change_rule_state(rule_id, body.enabled, user, valid)
     return {"id": rule_id, "enabled": body.enabled}
 
 
@@ -1259,17 +1349,12 @@ def rule_parameters(
     try:
         saved = store.set_rule_override(
             rule_id, candidate.version, candidate.logic, candidate.threshold_basis,
-            user["id"], previous_override["version"] if previous_override else current.version,
+            user, previous_override["version"] if previous_override else current.version,
             candidate.effective_from, candidate.effective_to,
             asdict(candidate),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    store.log(
-        user, "update_rule_parameters", "rule", rule_id,
-        f"version={current.version}->{candidate.version};effective={candidate.effective_from or 'legacy'}"
-        f"..{candidate.effective_to or 'open'};closed={saved['closed_version'] or '-'}@{saved['closed_on'] or '-'}",
-    )
     enabled = store.enabled_rule_ids()
     return _rule_payload(candidate, enabled is None or rule_id in enabled, saved)
 
@@ -1280,14 +1365,14 @@ def rule_trial(
     session: str | None = Cookie(default=None, alias=COOKIE_NAME),
 ) -> dict[str, Any]:
     user = _user(session)
-    _allow(user, "platform_admin", "org_admin", "accountant", "teacher")
+    _allow(user, "org_admin", "accountant", "teacher")
     entry = _audit_or_404(body.audit_id, user)
     current = _rule_by_id(rule_id)
     candidate = _candidate_rule(current, body)
     finding = engine.evaluate(candidate, entry["dataset"])
     store.log(
-        user, "trial_rule_parameters", "rule", rule_id,
-        f"audit={body.audit_id}; version={candidate.version}; result={finding.status}",
+        user, "trial_rule_parameters", "audit", body.audit_id,
+        f"rule={rule_id}; version={candidate.version}; result={finding.status}",
     )
     return _trial_payload(finding, body.audit_id)
 
@@ -1317,7 +1402,6 @@ def create_assignment(body: AssignmentBody,
         )
     except classroom.ClassroomError as exc:
         raise HTTPException(exc.status,str(exc)) from None
-    store.log(user, "create_assignment", "assignment", assignment_id, body.audit_id)
     return {"id": assignment_id}
 
 
@@ -1384,7 +1468,6 @@ def submit_assignment(assignment_id: str, body: SubmissionBody,
         store.save_submission(assignment_id, user["id"], body.selected_rule_ids, result["score"], result,user=user)
     except classroom.ClassroomError as exc:
         raise HTTPException(exc.status,str(exc)) from None
-    store.log(user, "submit_assignment", "assignment", assignment_id, f"score={result['score']}")
     return result
 
 
@@ -1414,7 +1497,6 @@ def review_submission(submission_id: str, body: ReviewBody,
     if store.submission_org(submission_id,user=user) != user["org_id"]:
         raise HTTPException(status_code=404, detail="提交记录不存在。")
     store.review_submission(submission_id, user["id"], body.adjusted_score, body.feedback.strip())
-    store.log(user, "review_submission", "submission", submission_id, f"score={body.adjusted_score}")
     return {"ok": True}
 
 
@@ -1423,7 +1505,7 @@ def submissions(assignment_id: str | None = None,
                 session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> list[dict[str, Any]]:
     user = _user(session)
     _allow(user, "teacher")
-    return store.list_submissions(user["org_id"], assignment_id,user_id=user["id"])
+    return store.list_submissions(user, assignment_id)
 
 
 @app.get("/api/audit-log")

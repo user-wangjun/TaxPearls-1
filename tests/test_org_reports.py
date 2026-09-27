@@ -60,6 +60,18 @@ class OrgReportTests(unittest.TestCase):
         self.assertEqual(result.status_code,200,result.text)
         return result.json()
 
+    def test_creation_log_failure_rolls_back_report_and_protection(self):
+        with patch.object(self.store, '_log', side_effect=RuntimeError('audit log unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'audit log unavailable'):
+                self.client.post('/api/org/reports', json={})
+        self.assertEqual(self.store.list_org_reports(self.admin), [])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM report_protections').fetchone()[0], 0)
+        saved = self.create()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit_log WHERE action='create_org_report' AND target_id=?",
+                                        (saved['id'],)).fetchone()[0], 1)
+
     def test_latest_business_period_not_upload_date_and_no_duplicate_client(self):
         data=self.client.get("/api/org/overview").json()
         by_id={row["client_id"]:row for row in data["rows"]}

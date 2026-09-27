@@ -8,6 +8,7 @@ Cloudflare Turnstile（免费、用户无感），接口形态不变。
 from __future__ import annotations
 
 from hashlib import sha256
+from hmac import compare_digest
 from secrets import choice, randbelow, token_hex
 from threading import RLock
 import base64
@@ -38,6 +39,10 @@ class _Puzzle:
 
 _store: dict[str, _Puzzle] = {}
 _lock = RLock()
+
+
+class CaptchaCapacityError(RuntimeError):
+    """Fail closed without evicting another user's unexpired challenge."""
 
 
 def _digest(answer: str) -> str:
@@ -98,19 +103,25 @@ def issue(text: str | None = None) -> dict[str, str]:
     captcha_id = token_hex(8)
     now = time.monotonic()
     with _lock:
+        for stale in [k for k, v in _store.items() if now >= v.expires_at]:
+            del _store[stale]
         if len(_store) >= MAX_KEYS:
-            for stale in [k for k, v in _store.items() if now > v.expires_at]:
-                del _store[stale]
+            raise CaptchaCapacityError("验证码容量暂满，请稍后重试。")
         _store[captcha_id] = _Puzzle(_digest(code), now + LIFETIME_SECONDS)
-    return {"captcha_id": captcha_id, "image": _render(code)}
+    try:
+        return {"captcha_id": captcha_id, "image": _render(code)}
+    except Exception:
+        with _lock:
+            _store.pop(captcha_id, None)
+        raise
 
 
 def verify(captcha_id: str, answer: str) -> bool:
     """校验并销毁。id 未知 / 已过期 / 答案错误均返回 False（不区分大小写）。"""
-    if not captcha_id or not (answer or "").strip():
+    if not captcha_id:
         return False
     with _lock:
         puzzle = _store.pop(captcha_id, None)  # 一次性：无论对错都销毁
-    if not puzzle or time.monotonic() > puzzle.expires_at:
+    if not puzzle or time.monotonic() >= puzzle.expires_at or not (answer or "").strip():
         return False
-    return puzzle.answer_hash == _digest(answer)
+    return compare_digest(puzzle.answer_hash, _digest(answer))

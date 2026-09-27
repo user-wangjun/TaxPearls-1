@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 import os
 import re
 import urllib.error
@@ -137,12 +138,15 @@ def _page(title: str, body_html: str, footnote: str) -> str:
 def send_password_reset_email(*, to: str, reset_url: str, expires_minutes: int = 10) -> str:
     """发送密码重置邮件。reset_url 为一次性重置链接（含长随机令牌）。"""
     subject = "【税海拾珠】重置登录密码"
+    reset_url = escape(reset_url,quote=True)
     body_html = (
         "<p>有人申请了重置本邮箱对应的登录密码。点击下面的链接设置新密码：</p>"
         f'<p><a href="{reset_url}">重置登录密码（{expires_minutes} 分钟内有效）</a></p>'
         f'<p style="color:#666">若按钮无法点击，可将以下地址粘贴到浏览器打开：<br>'
         f"<span style='word-break:break-all'>{reset_url}</span></p>"
-        "<p><b>该链接 10 分钟内有效且只能使用一次。</b>重置成功后，此账号的所有登录状态将被注销。</p>"
+        "<p><b>请在发起请求的同一浏览器打开并确认，该链接 10 分钟内有效且只能使用一次。</b>"
+        "其他浏览器无法使用，请回到原浏览器；丢失原浏览器时需在当前浏览器重新申请。"
+        "重置成功后，此账号的所有登录状态及待用邮箱凭证将被注销。</p>"
     )
     footnote = "若非本人操作，请忽略本邮件——您的账号不会被修改。请勿回复本邮件。"
     return send_email(to=to, subject=subject, html=_page("重置登录密码", body_html, footnote))
@@ -150,16 +154,27 @@ def send_password_reset_email(*, to: str, reset_url: str, expires_minutes: int =
 
 def send_registration_code_email(*, to: str, code: str, signup_url: str,
                                  expires_minutes: int = 10) -> str:
-    """发送注册验证邮件：6 位验证码 + 一键预填链接。"""
-    subject = f"【税海拾珠】注册验证码 {code}"
+    return _send_verification_email(to=to,code=code,url=signup_url,title='注册验证',expires_minutes=expires_minutes)
+
+
+def send_login_code_email(*, to: str, code: str, signup_url: str,
+                         expires_minutes: int = 10) -> str:
+    return _send_verification_email(to=to,code=code,url=signup_url,title='邮箱登录',expires_minutes=expires_minutes)
+
+
+def _send_verification_email(*, to: str, code: str, url: str, title: str, expires_minutes: int) -> str:
+    """Independent high-entropy link and six-digit code; both browser-bound."""
+    subject = f'【税海拾珠】{title}'
+    code,url=escape(code),escape(url,quote=True)
     body_html = (
-        "<p>您的注册验证码为：</p>"
+        f'<p>您的{title}验证码为：</p>'
         f'<p style="font-size:30px;font-weight:700;letter-spacing:.35em;color:#1a3a5c;'
         f'background:#f4f7fb;border:1px solid #dbe2ec;border-radius:8px;'
         f'padding:14px 10px;text-align:center">{code}</p>'
-        "<p>也可以点击下面的链接，验证码会自动填入：</p>"
-        f'<p><a href="{signup_url}">完成注册（{expires_minutes} 分钟内有效）</a></p>'
-        "<p><b>验证码 10 分钟内有效；连续输错 5 次将作废，需重新获取。</b></p>"
+        '<p>也可以在发起请求的同一浏览器打开下面的链接，并点击页面中的确认按钮：</p>'
+        f'<p><a href="{url}">确认{title}（{expires_minutes} 分钟内有效）</a></p>'
+        '<p><b>链接与验证码共用有效期；连续输错 5 次将作废，需重新获取。</b>'
+        '其他浏览器无法使用，请返回原浏览器；重发后旧链接和验证码立即失效。请勿转发。</p>'
     )
     footnote = "若非本人操作，请忽略本邮件。请勿回复本邮件。"
-    return send_email(to=to, subject=subject, html=_page("注册验证码", body_html, footnote))
+    return send_email(to=to, subject=subject, html=_page(title, body_html, footnote))
