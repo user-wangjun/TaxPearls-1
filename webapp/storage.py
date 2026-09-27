@@ -30,6 +30,7 @@ from src.models import Dataset, Finding
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "instance" / "taxpearls.db"
 SESSION_HOURS = 12
+REMEMBER_DAYS = 30
 ROLES = {"teacher", "student", "org_admin", "accountant", "platform_admin"}
 COMMON_PASSWORDS = {
     "password123!", "password1234!", "password12345!", "password2026!",
@@ -43,6 +44,10 @@ class SetupAlreadyInitialized(Exception):
     pass
 
 _passwords = PasswordHasher()
+
+
+def session_max_age(remember: bool = False) -> int:
+    return REMEMBER_DAYS * 24 * 3600 if remember else SESSION_HOURS * 3600
 
 
 def _now() -> str:
@@ -505,18 +510,23 @@ class Store:
         assert user is not None
         return user, session_token
 
-    def authenticate(self, username: str, password: str) -> tuple[dict[str, Any], str] | None:
+    def authenticate(self, username: str, password: str, *, remember: bool = False) -> tuple[dict[str, Any], str] | None:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT * FROM users WHERE username=? AND active=1", (username.strip().lower(),)).fetchone()
-            if not row:
+            identity = username.strip().lower()
+            # A bound email takes precedence over a legacy username with the
+            # same spelling, including when that email's account is disabled.
+            row = db.execute("SELECT * FROM users WHERE email=?", (identity,)).fetchone() if identity else None
+            if row is None:
+                row = db.execute("SELECT * FROM users WHERE username=?", (identity,)).fetchone()
+            if not row or not row["active"]:
                 return None
             try:
                 _passwords.verify(row["password_hash"], password)
             except (VerifyMismatchError, InvalidHashError):
                 return None
             token = secrets.token_urlsafe(32)
-            expires = (datetime.now(UTC) + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+            expires = (datetime.now(UTC) + timedelta(seconds=session_max_age(remember))).isoformat(timespec="seconds")
             db.execute("DELETE FROM sessions WHERE expires_at < ?", (_now(),))
             db.execute("INSERT INTO sessions VALUES (?,?,?,?)", (_hash_token(token), row["id"], expires, _now()))
         user = self.get_user(row["id"])

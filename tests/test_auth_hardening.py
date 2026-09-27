@@ -3,6 +3,9 @@ import auth_support
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
+from http.cookies import SimpleCookie
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -433,6 +436,110 @@ class AuthAbuseTests(unittest.TestCase):
                 self.assertNotIn(secret, response.text)
             register.assert_not_called()
             reset.assert_not_called()
+
+
+class PersistentPasswordLoginTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "login.db"
+        self.store = Store(self.path)
+        self.password = "Secure-browser-2026!"
+        self.user = self.store.create_initial_admin("original-owner", self.password, "管理", "default", "owner@example.com")
+        patches = patch.multiple(app_module, store=self.store, login_guard=LoginGuard(),
+                                 reset_confirm_limiter=RateLimiter({'token': (5, 900), 'ip': (40, 900)}))
+        patches.start()
+        self.addCleanup(patches.stop)
+        env = patch.dict(os.environ, {"TAXPEARLS_COOKIE_SECURE": "1", "TAXPEARLS_NOTIFICATION_EMAIL_ENABLED": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.client = TestClient(app_module.app, base_url="https://localhost")
+        self.addCleanup(self.client.close)
+
+    def login(self, **extra):
+        payload = {"username": "  OWNER@Example.COM  ", "password": self.password, **extra}
+        return self.client.post("/api/login", json=payload)
+
+    def test_cookie_and_database_expiry_match_and_do_not_slide(self):
+        for extra, seconds in (({}, 43200), ({"remember": False}, 43200), ({"remember": True}, 2592000)):
+            with self.subTest(extra=extra):
+                start = datetime.now(UTC)
+                response = self.login(**extra)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["user"]["id"], self.user["id"])
+                cookie = SimpleCookie(response.headers["set-cookie"])[app_module.COOKIE_NAME]
+                self.assertEqual(int(cookie["max-age"]), seconds)
+                self.assertTrue(cookie["httponly"])
+                self.assertTrue(cookie["secure"])
+                self.assertEqual(cookie["samesite"], "strict")
+                self.assertEqual(cookie["path"], "/")
+                token = cookie.value
+                with self.store.connect() as db:
+                    session = db.execute("SELECT * FROM sessions WHERE token_hash=?", (_hash_token(token),)).fetchone()
+                expires = datetime.fromisoformat(session["expires_at"])
+                self.assertAlmostEqual((expires - start).total_seconds(), seconds, delta=2)
+                self.assertNotEqual(session["token_hash"], token)
+                self.assertNotIn(token, response.text)
+                # A fresh Store connection models persistence across a server restart.
+                reopened = Store(self.path)
+                with patch("webapp.storage._now", return_value=(expires - timedelta(seconds=1)).isoformat(timespec="seconds")):
+                    self.assertEqual(reopened.user_for_token(token)["id"], self.user["id"])
+                    self.assertEqual(self.client.get("/api/me").status_code, 200)
+                with self.store.connect() as db:
+                    self.assertEqual(db.execute("SELECT expires_at FROM sessions WHERE token_hash=?", (_hash_token(token),)).fetchone()[0], session["expires_at"])
+                with patch("webapp.storage._now", return_value=(expires + timedelta(seconds=1)).isoformat(timespec="seconds")):
+                    self.assertIsNone(reopened.user_for_token(token))
+                    self.assertEqual(self.client.get("/api/me").status_code, 401)
+
+    def test_remembered_session_survives_default_window_but_ordinary_session_does_not(self):
+        ordinary = self.login().cookies[app_module.COOKIE_NAME]
+        remembered = self.login(remember=True).cookies[app_module.COOKIE_NAME]
+        future = (datetime.now(UTC) + timedelta(hours=13)).isoformat(timespec="seconds")
+        with patch("webapp.storage._now", return_value=future):
+            self.assertIsNone(self.store.user_for_token(ordinary))
+            self.assertEqual(self.store.user_for_token(remembered)["id"], self.user["id"])
+
+    def test_logout_revokes_only_current_device_and_rejects_replayed_cookie(self):
+        other = self.login(remember=True).cookies[app_module.COOKIE_NAME]
+        current = self.login(remember=True).cookies[app_module.COOKIE_NAME]
+        response = self.client.post("/api/logout")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(SimpleCookie(response.headers["set-cookie"])[app_module.COOKIE_NAME]["max-age"], "0")
+        self.assertEqual(self.client.get("/api/me").status_code, 401)
+        self.client.cookies.set(app_module.COOKIE_NAME, current)
+        self.assertEqual(self.client.get("/api/me").status_code, 401)
+        self.assertEqual(self.store.user_for_token(other)["id"], self.user["id"])
+
+    def test_reset_revokes_both_session_types_on_all_devices(self):
+        ordinary = self.login().cookies[app_module.COOKIE_NAME]
+        remembered = self.login(remember=True).cookies[app_module.COOKIE_NAME]
+        proof = auth_support.reset_proof(self.store, "owner@example.com")
+        self.client.cookies.set(app_module.EMAIL_COOKIE_NAME, auth_support.BROWSER)
+        response = self.client.post("/api/auth/password/reset/confirm", json={"token": proof, "password": "Fresh-browser-2026!"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(self.store.user_for_token(ordinary))
+        self.assertIsNone(self.store.user_for_token(remembered))
+        self.assertEqual(self.client.get("/api/me").status_code, 401)
+        self.assertEqual(self.login().status_code, 401)
+        self.assertEqual(self.login(password="Fresh-browser-2026!").status_code, 200)
+
+    def test_email_login_legacy_username_and_invalid_credentials(self):
+        self.assertEqual(self.login(username="original-owner").status_code, 200)
+        for extra in ({"password": "wrong-password"}, {"username": "unknown@example.com"}):
+            response = self.login(remember=True, **extra)
+            self.assertEqual(response.status_code, 401)
+            self.assertNotIn("set-cookie", response.headers)
+        with self.store.connect() as db:
+            db.execute("UPDATE users SET active=0 WHERE id=?", (self.user["id"],))
+        self.assertEqual(self.login(remember=True).status_code, 401)
+        self.assertEqual(self.client.get("/api/me").status_code, 401)
+
+    def test_bound_email_cannot_fall_back_to_another_accounts_username(self):
+        self.store.create_user("owner@example.com", "Different-browser-2026!", "旧账号", "student", "default", "legacy@example.com")
+        self.assertEqual(self.login(password="Different-browser-2026!").status_code, 401)
+        with self.store.connect() as db:
+            db.execute("UPDATE users SET active=0 WHERE id=?", (self.user["id"],))
+        self.assertEqual(self.login(password="Different-browser-2026!").status_code, 401)
 
 
 if __name__ == "__main__":
