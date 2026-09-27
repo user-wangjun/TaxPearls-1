@@ -12,6 +12,7 @@ from openpyxl import Workbook
 from src import config, engine, loader, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import material_key
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -186,7 +187,9 @@ class PeriodAggregationTests(unittest.TestCase):
         finding = next(finding for finding in engine.run(RULES, data) if finding.rule.id == "R-024")
         self.assertEqual(finding.status, "hit")
 
+    @material_key
     def test_web_material_preview_and_commit_keep_derived_period_evidence(self):
+        from tests.enterprise_support import confirm
         rows = [history_row("利润表.营业收入", 80, "2025-01"), history_row("利润表.营业收入", 100, "2025-12")]
         book = period_workbook("2026-01", rows, income=[("营业收入", 120)])
         with tempfile.TemporaryDirectory() as directory:
@@ -196,16 +199,13 @@ class PeriodAggregationTests(unittest.TestCase):
                 app_module.store.create_user("admin", "period-test-2026", "期间测试管理员", "org_admin", "default")
                 with TestClient(app_module.app) as client:
                     self.assertEqual(client.post("/api/login", json={"username": "admin", "password": "period-test-2026"}).status_code, 200)
-                    preview = client.post("/api/materials/preview", files={"files": ("periods.xlsx", book)}).json()
+                    preview = client.post("/api/enterprise/materials", files={"files": ("periods.xlsx", book)}).json()
                     document = preview["documents"][0]
                     rows_by_name = {row["name"]: row for row in document["rows"]}
                     self.assertEqual(rows_by_name["趋势.营业收入.同比率"]["value"], "0.5")
-                    selections = [{"id": document["id"], "company": document["company"], "rows": document["rows"], "reviewed": True}]
-                    committed = client.post("/api/materials/audit", json={
-                        "token": preview["token"], "mode": "separate", "selections": selections,
-                    })
+                    committed = confirm(client, preview)
                     self.assertEqual(committed.status_code, 200, committed.text)
-                    audit_id = committed.json()["results"][0]["audit"]["audit_id"]
+                    audit_id = committed.json()["audit_id"]
                     audit = client.get(f"/api/audits/{audit_id}").json()
                     metrics = {metric["name"]: metric for metric in audit["metrics"]}
                     self.assertEqual(metrics["历史.上年同期收入"]["value"], "80.00")

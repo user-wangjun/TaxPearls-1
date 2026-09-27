@@ -115,7 +115,7 @@ function renderNode(){
   const box=$("knowledgeDetail"),n=graphData.nodes.find(n=>n.id===graphSelected);box.replaceChildren();updateAIContext();if(!n){box.append(el("p","empty","选择节点查看来源和关联。"));return;}
   const badge=el("span","node-kind",graphKinds[n.kind][0]);badge.style.color=graphKinds[n.kind][1];box.append(badge,el("h3",null,n.label));
   for(const [key,label]of [["value","指标值"],["period","所属期间"],["category","规则类型"],["tax_type","税种"],["status","核对结果"],["conclusion","结论"],["calculation","计算过程"],["reason","未执行原因"],["scope","适用范围"],["source","材料来源"],["requirement","取数要求"],["suggestion","排查建议"]]){
-    if(n[key]===undefined||n[key]==="")continue;let value=n[key];if(key==="status")value={hit:"风险命中",pass:"检查通过",skipped:"材料不足"}[value];box.append(el("p","ev-title",label),el("p","kv",value===null?"未提供":value));
+    if(n[key]===undefined||n[key]==="")continue;let value=n[key];if(key==="status")value={hit:"风险命中",pass:"检查通过",skipped:"未执行"}[value];box.append(el("p","ev-title",label),el("p","kv",value===null?"未提供":value));
   }
   if(n.kind==="risk"&&graphData.audit_id)box.append(action("打开审计证据",()=>openAudit(graphData.audit_id)));
   for(const url of n.references||[]){if(!/^https?:\/\//i.test(url))continue;const a=el("a","kv","官方来源 ↗");a.href=url;a.target="_blank";a.rel="noopener noreferrer";box.append(a,el("br"));}

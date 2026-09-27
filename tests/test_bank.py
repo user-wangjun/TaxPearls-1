@@ -13,6 +13,7 @@ from openpyxl import Workbook
 from src import config, engine, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import confirm, material_key
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -160,6 +161,7 @@ class BankSourceParsing(unittest.TestCase):
             materials.build_dataset([source, adjustment], selections([source, adjustment]), {}, KEYS)
 
 
+@material_key
 class BankWebFlow(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -177,7 +179,7 @@ class BankWebFlow(unittest.TestCase):
 
     def test_source_and_adjustment_commit_with_persisted_evidence(self):
         response = self.client.post(
-            "/api/materials/preview",
+            "/api/enterprise/materials",
             files=[
                 ("files", ("建行导出.xlsx", source_workbook(SOURCE_ROWS))),
                 ("files", ("收入调节底稿.xlsx", adjustment_workbook(ADJUSTMENT_ROWS))),
@@ -187,15 +189,10 @@ class BankWebFlow(unittest.TestCase):
         draft = response.json()
         self.assertEqual(len(draft["documents"][0]["bank_transactions"]), 3)
         self.assertEqual(len(draft["documents"][1]["bank_adjustments"]), 4)
-        payload = {
-            "token": draft["token"], "mode": "merge", "same_scope": True,
-            "company": COMPANY, "selections": list(selections(draft["documents"]).values()),
-        }
-        audited = self.client.post("/api/materials/audit", json=payload)
+        audited = confirm(self.client, draft)
         self.assertEqual(audited.status_code, 200, audited.text)
         body = audited.json()
-        self.assertFalse(body["errors"], body)
-        audit = body["results"][0]["audit"]
+        audit = body
         r015 = next(item for item in audit["findings"] if item["id"] == "R-015")
         self.assertEqual(r015["status"], "pass")
         audit_id = audit["audit_id"]

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from tests.enterprise_support import audit, material_key
 
 from src import loader
 from webapp import app as app_module
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "样例企业-审计材料.xlsx"
 
 
+@material_key
 class ClientArchiveTests(unittest.TestCase):
     def test_management_scope_assignment_audit_link_and_persistence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -57,8 +59,8 @@ class ClientArchiveTests(unittest.TestCase):
                     })
                     self.assertEqual(mismatch.status_code, 200, mismatch.text)
                     with SAMPLE.open("rb") as stream:
-                        response = client.post(
-                            "/api/audit", data={"client_id": mismatch.json()["id"]},
+                        response = audit(client,
+                            data={"client_id": mismatch.json()["id"]},
                             files={"file": (SAMPLE.name, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
                         )
                     self.assertEqual(response.status_code, 422)
@@ -79,8 +81,8 @@ class ClientArchiveTests(unittest.TestCase):
                     self.assertEqual(dashboard["records"], [])
 
                     with SAMPLE.open("rb") as stream:
-                        response = client.post(
-                            "/api/audit", data={"client_id": client_id},
+                        response = audit(client,
+                            data={"client_id": client_id},
                             files={"file": (SAMPLE.name, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
                         )
                     self.assertEqual(response.status_code, 200, response.text)

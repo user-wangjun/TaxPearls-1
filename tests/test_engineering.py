@@ -18,11 +18,13 @@ from src import loader, materials, render
 from src.models import Company, Dataset
 from webapp import app as module
 from webapp.storage import Store, serialize_dataset, deserialize_dataset
+from tests.enterprise_support import audit as enterprise_audit, material_key
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / 'samples/样例企业-审计材料.xlsx'
 
 
+@material_key
 class EngineeringTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
@@ -32,6 +34,7 @@ class EngineeringTests(unittest.TestCase):
         replacement.start()
         self.addCleanup(replacement.stop)
         self.owner = self.store.create_user('owner', 'Review-Probe-2026!', '机构', 'org_admin', 'org')
+        self.store.create_user('teacher', 'Review-Probe-2026!', '教师', 'teacher', 'org')
         self.admin = self.store.create_user('root', 'Review-Probe-2026!', '平台', 'platform_admin', 'platform')
         self.client = TestClient(module.app, raise_server_exceptions=False)
         self.client.__enter__()
@@ -51,13 +54,13 @@ class EngineeringTests(unittest.TestCase):
 
     def test_unauthenticated_uploads_are_rejected_before_parsing(self):
         with patch.object(UploadFile, 'write', side_effect=AssertionError('body parsed')) as write:
-            for path in ('/api/audit', '/api/materials/preview', '/api/org/logo'):
+            for path in ('/api/audit', '/api/materials/preview', '/api/enterprise/materials', '/api/org/logo'):
                 response = self.client.post(path, files={'file':('sample.xlsx', b'0' * (2*1024*1024))})
                 self.assertEqual(response.status_code, 401)
         write.assert_not_called()
 
     def test_both_upload_paths_reject_expansion_and_large_bodies_without_spooling(self):
-        self.login()
+        self.login('teacher')
         buffer = BytesIO(SAMPLE.read_bytes())
         with ZipFile(buffer, 'a', ZIP_DEFLATED) as archive:
             with archive.open('unused.txt', 'w') as stream:
@@ -78,16 +81,21 @@ class EngineeringTests(unittest.TestCase):
                 response = self.client.post(path, files={field:('huge.xlsx',b'0' * (11*1024*1024))})
                 self.assertEqual(response.status_code, 422)
         self.assertFalse(any(rolled))
+        self.login()
+        with patch.object(UploadFile, 'write', observe):
+            response = self.client.post('/api/enterprise/materials', files={'files':('huge.xlsx',b'0' * (11*1024*1024))})
+            self.assertEqual(response.status_code, 422)
+        self.assertFalse(any(rolled))
 
     def test_audit_and_auto_client_roll_back_when_log_fails(self):
         self.login()
         with patch.object(self.store, '_log', side_effect=RuntimeError('log unavailable')):
-            response = self.client.post('/api/audit', files={'file':('sample.xlsx', SAMPLE.read_bytes())})
+            response = enterprise_audit(self.client, files={'file':('sample.xlsx', SAMPLE.read_bytes())})
         self.assertEqual(response.status_code, 500)
         with self.store.connect() as db:
             for table in ('audits', 'clients', 'audit_report_versions', 'notifications'):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0], 0)
-        response = self.client.post('/api/audit', files={'file':('sample.xlsx', SAMPLE.read_bytes())})
+        response = enterprise_audit(self.client, files={'file':('sample.xlsx', SAMPLE.read_bytes())})
         self.assertEqual(response.status_code, 200)
         with self.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM audit_log WHERE action='create_audit'").fetchone()[0], 1)

@@ -13,6 +13,7 @@ from openpyxl import Workbook
 from src import engine, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import confirm, material_key
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -160,6 +161,7 @@ class InvoiceSourceParsing(unittest.TestCase):
         self.assertIn("价税合计", materials.preview([("错误.xml", mismatch)], KEYS)[0]["error"])
 
 
+@material_key
 class InvoiceWebFlow(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -179,21 +181,16 @@ class InvoiceWebFlow(unittest.TestCase):
             ["S-WEB", "2026-01-02", "销项", 200, 26, 226, "正常", "", "", "", "", ""],
         ])
         response = self.client.post(
-            "/api/materials/preview",
+            "/api/enterprise/materials",
             files=[("files", ("销项导出.xlsx", sales)), ("files", ("采购.xml", invoice_xml()))],
         )
         self.assertEqual(response.status_code, 200, response.text)
         draft = response.json()
         self.assertEqual([doc["kind"] for doc in draft["documents"]], ["xlsx", "xml"])
-        payload = {
-            "token": draft["token"], "mode": "merge", "same_scope": True,
-            "company": COMPANY, "selections": list(selections(draft["documents"]).values()),
-        }
-        audited = self.client.post("/api/materials/audit", json=payload)
+        audited = confirm(self.client, draft)
         self.assertEqual(audited.status_code, 200, audited.text)
         body = audited.json()
-        self.assertFalse(body["errors"], body)
-        audit_id = body["results"][0]["audit"]["audit_id"]
+        audit_id = body["audit_id"]
         saved = app_module.store.get_audit(audit_id)["dataset"]
         self.assertEqual(saved.get("发票.销项净额"), 200)
         self.assertEqual(saved.get("发票.采购不含税净额"), 100)

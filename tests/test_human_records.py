@@ -5,13 +5,13 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from src import config, engine, loader, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import confirm, material_key
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +132,7 @@ class HumanRecordParsingTests(unittest.TestCase):
         self.assertEqual(dataset.get("人力.社保参保人数"), 1)
 
 
+@material_key
 class HumanRecordWebFlow(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -139,14 +140,7 @@ class HumanRecordWebFlow(unittest.TestCase):
         self.old_store = app_module.store
         app_module.store = Store(self.db_path)
         app_module.store.create_user("human-admin", "Human-test-2026!", "人力测试", "org_admin", "default")
-        # A separate upload router owns its own bounded in-memory drafts. DB
-        # replacement alone does not isolate the module-level app's closures.
-        app = FastAPI(routes=[r for r in app_module.app.routes if not r.path.startswith("/api/materials/")],
-                      exception_handlers=app_module.app.exception_handlers,
-                      middleware=app_module.app.user_middleware)
-        app_module.register_material_upload(app, app_module._user, app_module._allow,
-                                            app_module._save_audit, app_module.RULES_DIR, app_module._audit_or_404)
-        self.client = TestClient(app)
+        self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username": "human-admin", "password": "Human-test-2026!"})
 
     def tearDown(self):
@@ -155,22 +149,17 @@ class HumanRecordWebFlow(unittest.TestCase):
         self.temp.cleanup()
 
     def audit(self, content):
-        preview = self.client.post("/api/materials/preview", files=[("files", ("人力来源.xlsx", content))])
+        preview = self.client.post("/api/enterprise/materials", files=[("files", ("人力来源.xlsx", content))])
         self.assertEqual(preview.status_code, 200, preview.text)
         self.assertNotIn("隐私姓名", preview.text)
         self.assertNotIn("SECRET-ID", preview.text)
         draft = preview.json()
-        doc = draft["documents"][0]
-        return self.client.post("/api/materials/audit", json={
-            "token": draft["token"], "mode": "merge", "same_scope": True,
-            "company": doc["company"], "selections": [{"id": doc["id"], "company": doc["company"]}],
-        })
+        return confirm(self.client, draft)
 
     def test_human_evidence_privacy_archive_and_reopened_store(self):
         response = self.audit(human_workbook())
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertFalse(response.json()["errors"])
-        audit = response.json()["results"][0]["audit"]
+        audit = response.json()
         metric = {m["name"]: m for m in audit["metrics"]}
         self.assertEqual(metric["人力.个税申报人数"]["value"], "2.00")
         self.assertEqual(metric["人力.社保参保人数"]["value"], "1.00")
@@ -195,10 +184,13 @@ class HumanRecordWebFlow(unittest.TestCase):
             self.assertNotIn(loader._human_person_key("SECRET-ID-001", "测试"), output)
 
     def test_no_common_month_does_not_create_audit(self):
-        response = self.audit(human_workbook(month="2026-04"))
+        response = self.client.post('/api/enterprise/materials',
+                                    files={'files': ('人力来源.xlsx', human_workbook(month='2026-04'))})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["results"], [])
-        self.assertIn("没有相同所属月", str(response.json()["errors"]))
+        batch = response.json()
+        self.assertFalse(batch['analysis']['can_confirm'])
+        self.assertIn('没有相同所属月', str(batch['analysis']['feedback']['blocking']))
+        self.assertEqual(confirm(self.client, batch).status_code, 409)
         with app_module.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM audits").fetchone()[0], 0)
 

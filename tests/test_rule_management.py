@@ -15,12 +15,14 @@ from src import engine, loader
 from webapp import app as app_module
 from webapp.storage import Store
 from webapp.access import AccessDenied
+from tests.enterprise_support import audit as enterprise_audit, material_key
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "样例企业-审计材料.xlsx"
 
 
+@material_key
 class RuleManagementTests(unittest.TestCase):
     def test_publish_log_failure_rolls_back_new_version_and_previous_end(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -237,7 +239,9 @@ class RuleManagementTests(unittest.TestCase):
                     assigned_client_id = assigned_client.json()["id"]
 
                     self.assertEqual(self._login(client, 'teachera', 'teachera-pass-2026').status_code, 200)
-                    first_audit = self._upload(client)
+                    teaching = client.post('/api/audit', files={'file': (SAMPLE.name, SAMPLE.read_bytes())})
+                    self.assertEqual(teaching.status_code, 200, teaching.text)
+                    first_audit = teaching.json()['audit_id']
                     rule = self._rule(client, "R-001")
                     self.assertEqual(rule["version"], "2.0")
                     self.assertFalse(rule["customized"])
@@ -340,7 +344,7 @@ class RuleManagementTests(unittest.TestCase):
     @staticmethod
     def _upload(client: TestClient, client_id: str | None = None) -> str:
         with SAMPLE.open("rb") as stream:
-            response = client.post("/api/audit", files={
+            response = enterprise_audit(client, files={
                 "file": (SAMPLE.name, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             }, data={"client_id": client_id} if client_id else None)
         if response.status_code != 200:

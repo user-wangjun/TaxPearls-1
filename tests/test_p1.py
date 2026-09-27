@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from tests.enterprise_support import audit, material_key
 
 from src import engine, loader, training
 from webapp import app as app_module
@@ -134,6 +135,7 @@ class P1WebFlow(unittest.TestCase):
             finally:
                 app_module.store = old_store
 
+    @material_key
     def test_role_boundaries_and_accountant_export_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
             old_store = app_module.store
@@ -158,8 +160,8 @@ class P1WebFlow(unittest.TestCase):
                     })
                     self.assertEqual(customer.status_code, 200, customer.text)
                     with (ROOT / "samples" / "样例企业-审计材料.xlsx").open("rb") as stream:
-                        response = client.post(
-                            "/api/audit", data={"client_id": customer.json()["id"]},
+                        response = audit(client,
+                            data={"client_id": customer.json()["id"]},
                             files={"file": ("sample.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
                         )
                     self.assertEqual(response.status_code, 200, response.text)

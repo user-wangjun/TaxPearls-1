@@ -24,12 +24,16 @@ def main():
     subprocess.run([sys.executable, '-m', 'pip', 'check'], check=True)
     subprocess.run([sys.executable, '-m', 'ruff', 'check', 'main.py', 'src', 'webapp', 'scripts', 'tests'], check=True)
     subprocess.run(['node', 'scripts/check_frontend.cjs'], check=True)
+    subprocess.run(['node', 'scripts/check_enterprise_frontend.cjs'], check=True)
     with tempfile.TemporaryDirectory(prefix='taxpearls-check-') as directory:
         os.environ.update(TAXPEARLS_DB=str(Path(directory) / 'bootstrap.db'),
                           TAXPEARLS_AI_ENABLED='0', TAXPEARLS_NOTIFICATION_EMAIL_ENABLED='0',
                           TAXPEARLS_AI_API_KEY='', TAXPEARLS_RESEND_API_KEY='',
-                          TAXPEARLS_BACKUP_KEY='')
-        suite = unittest.defaultTestLoader.discover('tests', pattern=sys.argv[1] if len(sys.argv) > 1 else 'test_*.py')
+                          TAXPEARLS_BACKUP_KEY='', TAXPEARLS_MATERIAL_KEY='')
+        # Multiple explicit patterns let related migrations share one isolated
+        # process and the same source-stability/contract checks.
+        suite = unittest.TestSuite(unittest.defaultTestLoader.discover('tests', pattern=pattern)
+                                   for pattern in dict.fromkeys(sys.argv[1:] or ['test_*.py']))
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     after = fingerprint()
     changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))

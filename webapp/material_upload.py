@@ -1,4 +1,4 @@
-"""Authenticated preview/review/batch import routes; raw uploads remain in RAM."""
+"""Legacy teaching preview/review routes; enterprise uses persistent batches."""
 from __future__ import annotations
 
 import json
@@ -86,7 +86,7 @@ def register(app, get_user, allow, save_audit, rules_dir, audit_for_user):
     @app.get("/api/materials/jobs/{job_id}")
     def job_status(job_id: str, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher")
+        allow(user, "teacher")
         with lock:
             purge()
             job = jobs.get(job_id)
@@ -97,7 +97,7 @@ def register(app, get_user, allow, save_audit, rules_dir, audit_for_user):
     @app.post("/api/materials/preview")
     async def preview(request: Request, background: BackgroundTasks, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher")
+        allow(user, "teacher")
         if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
             raise HTTPException(422, "请以多文件表单上传材料。")
         try:
@@ -191,7 +191,7 @@ def register(app, get_user, allow, save_audit, rules_dir, audit_for_user):
     @app.post("/api/materials/audit")
     async def audit(request: Request, session: str | None = Cookie(default=None, alias="taxpearls_session")):
         user = get_user(session)
-        allow(user, "org_admin", "accountant", "teacher")
+        allow(user, "teacher")
         try:
             chunks = [chunk async for chunk in bounded_stream(request, 2 * 1024 * 1024)]
             body = json.loads(b"".join(chunks))

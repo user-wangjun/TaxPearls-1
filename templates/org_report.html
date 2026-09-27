@@ -13,7 +13,7 @@
 {% if report.mixed_rule_sets %}<p class="high">客户规则集合或版本/定义不同：按各自冻结口径统计，不比较命中率；规则分布按定义指纹分别列示。</p>{% endif %}
 <h2>一、范围与检查统计</h2><div class="stats">
 <div class="stat"><strong>{{ report.totals.clients }}</strong>所选客户</div><div class="stat"><strong>{{ report.totals.audited }}</strong>有匹配审计</div><div class="stat"><strong>{{ report.totals.no_audit }}</strong>无匹配审计</div><div class="stat"><strong>{{ report.totals.high }}</strong>有高等级命中</div></div>
-<p>合计命中 {{ report.totals.hit }} 条、通过 {{ report.totals.pass }} 条、未执行 {{ report.totals.skipped }} 条；本次检查全部通过的客户 {{ report.totals['clear'] }} 家，未命中但材料不足 {{ report.totals.incomplete }} 家。</p>
+<p>合计命中 {{ report.totals.hit }} 条、通过 {{ report.totals.pass }} 条、未执行 {{ report.totals.skipped }} 条；本次检查全部通过的客户 {{ report.totals['clear'] }} 家，未命中但仍有检查未执行 {{ report.totals.incomplete }} 家。</p>
 <p class="muted">机构历史未纳入候选的审计：未关联当前客户档案 {{ report.excluded_audits.unlinked }} 份、主体不匹配 {{ report.excluded_audits.identity_mismatch }} 份、期间无法识别 {{ report.excluded_audits.invalid_period }} 份。该计数是机构级历史说明，不表示所选客户都已完成审计。</p>
 <h2>二、客户风险清单</h2>
 <table><colgroup><col style="width:30%"><col style="width:25%"><col style="width:25%"><col style="width:20%"></colgroup><thead><tr><th>客户 / 税号</th><th>审计期间 / 负责会计</th><th>检查状态</th><th>命中 / 通过 / 未执行</th></tr></thead><tbody>

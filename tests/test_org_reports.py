@@ -95,6 +95,9 @@ class OrgReportTests(unittest.TestCase):
         self.assertEqual(data["totals"]["clear"],1)
         result=self.create(period="2026年1月",client_ids=[self.clients[0]["id"]])
         self.assertEqual(result["snapshot"]["totals"]["clients"],1)
+        html = self.client.get('/api/org/reports/' + result['id'] + '/html').text
+        self.assertIn('未命中但仍有检查未执行', html)
+        self.assertNotIn('未命中但材料不足', html)
         self.assertNotIn(self.clients[1]["id"],{row["client_id"] for row in result["snapshot"]["rows"]})
         self.assertEqual(len(data["available_periods"]),3)  # aliases collapse
         self.assertEqual(self.client.get("/api/org/overview?period=0000").status_code,422)

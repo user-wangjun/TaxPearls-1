@@ -18,12 +18,14 @@ from src.settings import AISettings
 from webapp import app as module
 from webapp.access import AccessDenied
 from webapp.storage import Store
+from tests.enterprise_support import audit as enterprise_audit, confirm, material_key
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / 'samples' / '样例企业-审计材料.xlsx'
 
 
+@material_key
 class TenantIsolationTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {'TAXPEARLS_AI_ENABLED': '0', 'TAXPEARLS_NOTIFICATION_EMAIL_ENABLED': '0'})
@@ -69,14 +71,13 @@ class TenantIsolationTests(unittest.TestCase):
         self.client.cookies.set(module.COOKIE_NAME, self.store.authenticate(person['username'], self.password)[1])
 
     def upload(self, **fields):
-        return self.client.post('/api/audit', data=fields, files={'file': ('sample.xlsx', SAMPLE.read_bytes())})
+        return enterprise_audit(self.client, data=fields, files={'file': ('sample.xlsx', SAMPLE.read_bytes())})
 
     def preview(self):
-        response = self.client.post('/api/materials/preview', files={'files': ('sample.xlsx', SAMPLE.read_bytes())})
+        response = self.client.post('/api/enterprise/materials', data={'client_id': self.customer['id']},
+                                    files={'files': ('sample.xlsx', SAMPLE.read_bytes())})
         self.assertEqual(response.status_code, 200, response.text)
-        draft = response.json()
-        return {'token': draft['token'], 'mode': 'separate', 'client_id': self.customer['id'],
-                'selections': [{'id': d['id'], 'confirmed': True, 'rows': d['rows'], 'company': d['company']} for d in draft['documents']]}
+        return response.json()
 
     def test_five_roles_existing_entry_matrix_and_scoped_audit_reads(self):
         teacher=self.person('matrix-teacher','teacher','alpha')
@@ -139,11 +140,11 @@ class TenantIsolationTests(unittest.TestCase):
     def test_material_result_replay_rechecks_current_client_assignment(self):
         self.login(self.accountant)
         body = self.preview()
-        committed = self.client.post('/api/materials/audit', json=body)
+        committed = confirm(self.client, body)
         self.assertEqual(committed.status_code, 200, committed.text)
-        self.assertEqual(len(committed.json()['results']), 1, committed.text)
+        self.assertIn('audit_id', committed.json())
         self.store.upsert_client(self.admin, self.customer['name'], self.customer['taxpayer_id'], self.other['id'])
-        replay = self.client.post('/api/materials/audit', json=body)
+        replay = confirm(self.client, body)
         self.assertIn(replay.status_code, (403, 404))
 
     def test_material_preview_cannot_follow_account_into_different_org(self):
@@ -151,8 +152,7 @@ class TenantIsolationTests(unittest.TestCase):
         body = self.preview()
         with self.store.connect() as db:
             db.execute("UPDATE users SET org_id='beta' WHERE id=?", (self.accountant['id'],))
-        body.pop('client_id')
-        response = self.client.post('/api/materials/audit', json=body)
+        response = confirm(self.client, body)
         self.assertIn(response.status_code, (403, 404, 422))
         self.assertEqual(self.client.get('/api/audits').json(), [])
 
@@ -217,19 +217,26 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/clients', json=body).status_code, 422)
         self.assertEqual(self.store.get_client(self.customer['id'])['accountant_id'], self.accountant['id'])
 
-    def test_cache_repeat_is_idempotent_but_role_change_invalidates_draft(self):
+    def test_confirmation_repeat_is_idempotent_and_rechecks_current_role(self):
         self.login(self.accountant)
         body = self.preview()
-        first = self.client.post('/api/materials/audit', json=body)
+        first = confirm(self.client, body)
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(self.client.post('/api/materials/audit', json=body).json(), first.json())
+        self.assertEqual(confirm(self.client, body).json(), first.json())
         self.assertEqual(len(self.client.get('/api/audits').json()), 2)
         with self.store.connect() as db:
             db.execute("UPDATE users SET role='org_admin' WHERE id=?", (self.accountant['id'],))
-        self.assertEqual(self.client.post('/api/materials/audit', json=body).status_code, 422)
+        # A current org admin still has this client's permission. A teacher
+        # cannot replay the enterprise result, even with the old session.
+        self.assertEqual(confirm(self.client, body).status_code, 200)
+        with self.store.connect() as db:
+            db.execute("UPDATE users SET role='teacher' WHERE id=?", (self.accountant['id'],))
+        self.assertEqual(confirm(self.client, body).status_code, 403)
 
     def test_async_material_job_is_bound_to_owner_org_and_role(self):
-        self.login(self.accountant)
+        teacher = self.person('job-teacher', 'teacher', 'alpha')
+        other_teacher = self.person('other-job-teacher', 'teacher', 'alpha')
+        self.login(teacher)
         settings = AISettings(enabled=True, api_key='synthetic-test-only')
         with patch('webapp.material_upload.AISettings.from_env', return_value=settings), \
                 patch('webapp.material_upload.materials.preview', return_value=[]):
@@ -238,16 +245,16 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(started.status_code, 202)
         url = '/api/materials/jobs/' + started.json()['job_id']
         self.assertEqual(self.client.get(url).json()['state'], 'done')
-        self.login(self.other)
+        self.login(other_teacher)
         self.assertEqual(self.client.get(url).status_code, 404)
-        self.login(self.accountant)
+        self.login(teacher)
         for field, value in [('org_id', 'beta'), ('role', 'org_admin')]:
             with self.subTest(field=field):
                 with self.store.connect() as db:
-                    db.execute(f'UPDATE users SET {field}=? WHERE id=?', (value, self.accountant['id']))
-                self.assertEqual(self.client.get(url).status_code, 404)
+                    db.execute(f'UPDATE users SET {field}=? WHERE id=?', (value, teacher['id']))
+                self.assertEqual(self.client.get(url).status_code, 404 if field == 'org_id' else 403)
                 with self.store.connect() as db:
-                    db.execute(f'UPDATE users SET {field}=? WHERE id=?', (self.accountant[field], self.accountant['id']))
+                    db.execute(f'UPDATE users SET {field}=? WHERE id=?', (teacher[field], teacher['id']))
 
     def test_late_reassignment_prevents_atomic_audit_and_ai_cache_writes(self):
         entry = self.store.get_audit(self.audit)

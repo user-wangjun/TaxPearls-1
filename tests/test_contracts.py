@@ -6,13 +6,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from src import config, engine, materials
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import confirm, material_key
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -231,6 +231,7 @@ class ContractLedgerParsing(unittest.TestCase):
             materials.build_dataset(docs, selections(docs), COMPANY, KEYS)
 
 
+@material_key
 class ContractLedgerWebFlow(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -240,13 +241,7 @@ class ContractLedgerWebFlow(unittest.TestCase):
         app_module.store.create_user(
             "contract-admin", "contract-test-2026", "合同测试", "org_admin", "default"
         )
-        # Isolate transient upload drafts as well as the persisted test DB.
-        app = FastAPI(routes=[r for r in app_module.app.routes if not r.path.startswith("/api/materials/")],
-                      exception_handlers=app_module.app.exception_handlers,
-                      middleware=app_module.app.user_middleware)
-        app_module.register_material_upload(app, app_module._user, app_module._allow,
-                                            app_module._save_audit, app_module.RULES_DIR, app_module._audit_or_404)
-        self.client = TestClient(app)
+        self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username": "contract-admin", "password": "contract-test-2026"})
 
     def tearDown(self):
@@ -256,20 +251,15 @@ class ContractLedgerWebFlow(unittest.TestCase):
 
     def test_preview_audit_and_persisted_four_flow_evidence(self):
         response = self.client.post(
-            "/api/materials/preview", files=[("files", ("四流台账.xlsx", contract_workbook()))]
+            "/api/enterprise/materials", files=[("files", ("四流台账.xlsx", contract_workbook()))]
         )
         self.assertEqual(response.status_code, 200, response.text)
         draft = response.json()
         self.assertEqual(len(draft["documents"][0]["contracts"]), 1)
-        payload = {
-            "token": draft["token"], "mode": "merge", "same_scope": True,
-            "company": COMPANY, "selections": list(selections(draft["documents"]).values()),
-        }
-        audited = self.client.post("/api/materials/audit", json=payload)
+        audited = confirm(self.client, draft)
         self.assertEqual(audited.status_code, 200, audited.text)
         body = audited.json()
-        self.assertFalse(body["errors"], body)
-        audit_id = body["results"][0]["audit"]["audit_id"]
+        audit_id = body["audit_id"]
         saved = Store(self.db_path).get_audit(audit_id)["dataset"]
         self.assertEqual(saved.get("合同.四流完整合同数量"), 1)
         self.assertIn("四流台账.xlsx", saved.source_of("合同.四流完整勾稽金额"))
@@ -277,17 +267,13 @@ class ContractLedgerWebFlow(unittest.TestCase):
     def test_pending_and_complete_metrics_survive_history_without_changing_rule_counts(self):
         for complete in (True, False):
             with self.subTest(complete=complete):
-                draft = self.client.post("/api/materials/preview", files=[("files", (
+                draft = self.client.post("/api/enterprise/materials", files=[("files", (
                     "归集来源.xlsx", contract_workbook(include_invoice=complete, include_bank=complete,
                                                    include_fulfillment=complete, include_link=complete),
                 ))]).json()
-                result = self.client.post("/api/materials/audit", json={
-                    "token": draft["token"], "mode": "merge", "same_scope": True,
-                    "company": COMPANY, "selections": list(selections(draft["documents"]).values()),
-                })
+                result = confirm(self.client, draft)
                 self.assertEqual(result.status_code, 200, result.text)
-                self.assertFalse(result.json()["errors"])
-                audit = result.json()["results"][0]["audit"]
+                audit = result.json()
                 metrics = {m["name"]: m for m in audit["metrics"]}
                 self.assertEqual(metrics["合同.四流完整合同数量"]["value"], "1.00" if complete else "0.00")
                 self.assertEqual(metrics["合同.四流待完善合同数量"]["value"], "0.00" if complete else "1.00")

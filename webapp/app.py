@@ -474,6 +474,7 @@ def _result(entry: dict[str, Any]) -> dict[str, Any]:
         "company": _company_dict(dataset), "summary": vm["summary"],
         "findings": vm["findings"], "metrics": _metrics_list(dataset),
         "narrative": narrative,
+        "material_reference": entry.get("material_reference"),
     }
 
 
@@ -529,6 +530,11 @@ def mistake_book_script() -> FileResponse:
 @app.get("/console.js")
 def console_script():
     return FileResponse(STATIC_DIR / "console.js", media_type="text/javascript")
+
+
+@app.get("/enterprise.js")
+def enterprise_script() -> FileResponse:
+    return FileResponse(STATIC_DIR / "enterprise.js", media_type="text/javascript")
 
 
 @app.get("/workspace.css")
@@ -1031,7 +1037,9 @@ def create_client(body: ClientBody, session: str | None = Cookie(default=None, a
 @app.post("/api/audit")
 async def audit(request: Request, session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> Response:
     user = _user(session)
-    _allow(user, "org_admin", "accountant", "teacher")
+    # Legacy direct import is teaching-only. Business uploads must retain
+    # originals and explicitly confirm a server-side analysis revision.
+    _allow(user, "teacher")
     async with multipart(request) as form:
         file = single_file(form)
         if not file.filename or not file.filename.lower().endswith(".xlsx"):
@@ -1048,7 +1056,8 @@ async def audit(request: Request, session: str | None = Cookie(default=None, ali
 
 
 def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = None,
-                *, frozen_rules: list[Rule] | None = None, exercise_metadata: dict | None = None) -> dict[str, Any]:
+                *, frozen_rules: list[Rule] | None = None, exercise_metadata: dict | None = None,
+                material_context: dict | None = None, frozen_graph_rule: Rule | None = None) -> dict[str, Any]:
     if user["role"] == "teacher" and not _is_synthetic_dataset(dataset):
         raise HTTPException(403, "教师只能导入明确标记为仿真样例的教学数据，严禁使用真实企业账套。")
     if user['role'] == 'teacher' and client_id is not None:
@@ -1062,12 +1071,14 @@ def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = 
         if client["taxpayer_id"] != dataset.company.taxpayer_id:
             raise HTTPException(422, "审计材料中的纳税人识别号与所选客户档案不一致。")
     try:
+        from src import related_graph
+        if material_context is not None and frozen_graph_rule != related_graph.definition():
+            raise AccessDenied('关联方检查范围或版本已变化，请重新分析并确认材料。', 409)
         enabled = store.enabled_rule_ids()
         rules = _audit_rules(dataset, enabled) if frozen_rules is None else frozen_rules
         findings = engine.run(rules, dataset)
         # FR-B09 is a separate relationship traversal, not a YAML condition.
-        from src import related_graph
-        findings.extend(related_graph.run(dataset))
+        findings.extend(related_graph.run(dataset, include_unavailable=material_context is not None))
         findings.sort(key=lambda f: ({"hit": 0, "pass": 1, "skipped": 2}[f.status], -f.severity_rank, f.rule.id))
     except engine.RuleError as exc:
         raise HTTPException(500, f"规则执行失败：{exc}")
@@ -1075,10 +1086,14 @@ def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = 
     when = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
     vm = render.build_view_model(dataset, findings)
     from webapp.report_archive import build_snapshot
+    material_reference = ({'batch_id': material_context['batch_id'], 'analysis_revision': material_context['revision'],
+                           'confirmation_revision': material_context['revision'] + 1} if material_context else None)
     snapshot = build_snapshot({"id": audit_id, "org_id": user["org_id"], "audited_at": when,
-                               "dataset": dataset, "findings": findings}, _org_branding(user["org_id"]))
+                               "dataset": dataset, "findings": findings, 'material_reference': material_reference},
+                              _org_branding(user["org_id"]))
     store.save_audit(audit_id, user, client_id, dataset, findings, vm["summary"], when,
-                     report_snapshot=snapshot, exercise_metadata=exercise_metadata, create_client=True)
+                     report_snapshot=snapshot, exercise_metadata=exercise_metadata, create_client=True,
+                     material_context=material_context)
     entry = store.get_audit(audit_id)
     assert entry is not None
     return _result(entry)
@@ -1086,6 +1101,11 @@ def _save_audit(dataset: Dataset, user: dict[str, Any], client_id: str | None = 
 
 from webapp.material_upload import register as register_material_upload
 register_material_upload(app, _user, _allow, _save_audit, RULES_DIR, _audit_or_404)
+
+from webapp.enterprise_materials import register as register_enterprise_materials
+register_enterprise_materials(app, lambda: store, _user, _allow, RULES_DIR,
+                             lambda dataset: _audit_rules(dataset, store.enabled_rule_ids()),
+                             _save_audit, lambda audit_id, user: _result(_audit_or_404(audit_id, user)))
 
 from webapp.exercises import register as register_exercises
 register_exercises(app, lambda: store, _user, _allow, _audit_or_404, lambda data, enabled: _audit_rules(data,enabled),

@@ -15,6 +15,7 @@ from webapp.knowledge import (
     generate_audit_narrative, interpret_finding,
 )
 from webapp.storage import Store
+from tests.enterprise_support import audit as enterprise_audit, material_key
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -171,6 +172,7 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 503)
 
 
+@material_key
 class FindingInterpretationWebTests(unittest.TestCase):
     def test_hit_only_permissions_cache_and_restart_persistence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +186,7 @@ class FindingInterpretationWebTests(unittest.TestCase):
                     login = client.post("/api/login", json={"username": "admin", "password": "interpret-test-2026"})
                     self.assertEqual(login.status_code, 200, login.text)
                     with (ROOT / "samples" / "样例企业-审计材料.xlsx").open("rb") as stream:
-                        audit = client.post("/api/audit", files={"file": ("sample.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+                        audit = enterprise_audit(client, files={"file": ("sample.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
                     self.assertEqual(audit.status_code, 200, audit.text)
                     body = audit.json()
                     audit_id = body["audit_id"]
@@ -238,7 +240,7 @@ class FindingInterpretationWebTests(unittest.TestCase):
                     login = client.post("/api/login", json={"username": "admin", "password": "narrative-test-2026"})
                     self.assertEqual(login.status_code, 200, login.text)
                     with (ROOT / "samples" / "样例企业-审计材料.xlsx").open("rb") as stream:
-                        audit = client.post("/api/audit", files={"file": ("sample.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+                        audit = enterprise_audit(client, files={"file": ("sample.xlsx", stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
                     self.assertEqual(audit.status_code, 200, audit.text)
                     body = audit.json()
                     audit_id = body["audit_id"]

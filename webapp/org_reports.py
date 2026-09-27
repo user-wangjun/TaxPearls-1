@@ -23,7 +23,7 @@ from webapp.storage import deserialize_findings
 
 TEMPLATE = render.TEMPLATE_DIR / "org_report.html"
 LABELS = {"high":"有高等级命中", "medium":"有中等级命中", "low":"有低等级命中",
-          "incomplete":"未命中但材料不足", "clear":"本次检查全部通过", "not_run":"未执行检查", "no_audit":"无匹配审计"}
+          "incomplete":"未命中但仍有检查未执行", "clear":"本次检查全部通过", "not_run":"未执行检查", "no_audit":"无匹配审计"}
 
 
 def period_info(value):

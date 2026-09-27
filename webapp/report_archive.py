@@ -26,6 +26,7 @@ def build_snapshot(entry, branding, narrative=None, origin="generated") -> dict:
         org_name=branding["display_name"], report_title=branding["report_title"],
         footer_text=branding["footer_text"], logo_data_uri=branding["logo_data_uri"],
         ai_narrative=narrative, template_source=template, protect=False,
+        material_reference=entry.get('material_reference'),
     )
     manifest = {
         "schema": 1, "origin": origin, "audit_id": entry["id"], "org_id": entry["org_id"],
@@ -40,6 +41,8 @@ def build_snapshot(entry, branding, narrative=None, origin="generated") -> dict:
         "narrative_sha256": digest(canonical(narrative).encode()) if narrative else None,
         "narrative_model": narrative.get("model") if narrative else None,
     }
+    if entry.get('material_reference'):
+        manifest['material_reference'] = entry['material_reference']
     html, protection = protect_html(html,entry["dataset"].company.name,when.date().isoformat(),
                                     manifest["report_no"],context=canonical(manifest),registered=True)
     manifest["protection"] = protection

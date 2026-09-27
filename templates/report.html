@@ -363,7 +363,7 @@
   </table>
 
   <div class="cover-foot">
-    本报告由{{ org_name }}税务风险审计引擎依据被审计单位提供的资料自动生成，共执行 {{ summary.total }} 项风险检查规则。<br>
+    本报告由{{ org_name }}税务风险审计引擎依据所提供的资料自动生成；纳入 {{ summary.total }} 项检查，实际完成 {{ summary.hit + summary.pass }} 项，未执行 {{ summary.skipped }} 项。<br>
     报告结论基于所提供资料的真实、完整与合法，仅供内部风险管理与教学演示使用。
   </div>
 </section>
@@ -372,17 +372,20 @@
 <h2>一、审计概况</h2>
 
 <p class="indent">
-  本次审计针对 {{ company.name }}（{{ company.period }}）提供的科目余额表与增值税纳税申报表开展，
-  资料经标准化处理后执行 {{ summary.total }} 项税务风险检查规则，覆盖收入完整性、税会勾稽、指标偏离
-  及外部数据交叉四类检查维度。全部判定均由确定性规则计算得出，每项结论均附触发明细、计算过程与
-  法律依据，可供人工复核。
+  本次检查针对 {{ company.name }}（{{ company.period }}）的已保存输入开展，实际材料来源见下表。
+  纳入检查范围 {{ summary.total }} 项，实际完成 {{ summary.hit + summary.pass }} 项；
+  未执行的 {{ summary.skipped }} 项不能视为已覆盖或已通过。风险判定由确定性规则计算，
+  证据、计算过程及适用依据见各项明细；资料不足时不推定已经提供相关账表，也不补造结论。
 </p>
 
 <table class="data">
   <tr><th style="width:26%">项目</th><th>说明</th></tr>
   <tr><td>资料来源</td><td>{{ sources | join("、") }}</td></tr>
+  {% if material_reference %}
+  <tr><td>确认材料版本</td><td style="overflow-wrap:anywhere">批次 {{ material_reference.batch_id }} · 分析版本 {{ material_reference.analysis_revision }} · 确认版本 {{ material_reference.confirmation_revision }}<br>对应本报告生成时的固定输入；登录企业结果页可查看当时的材料、修改与检查范围。后续补传不改变本报告，原件当前可用状态以受控查询为准。</td></tr>
+  {% endif %}
   <tr><td>判定方式</td><td>确定性规则引擎自动判定，未使用生成式模型进行风险识别</td></tr>
-  <tr><td>执行规则数</td><td>{{ summary.total }} 项（命中 {{ summary.hit }} 项，通过 {{ summary.pass }} 项，未执行 {{ summary.skipped }} 项）</td></tr>
+  <tr><td>本次检查范围</td><td>{{ summary.total }} 项（命中 {{ summary.hit }} 项，通过 {{ summary.pass }} 项，未执行 {{ summary.skipped }} 项）</td></tr>
 </table>
 
 <!-- ======================== 二、审计结论 ======================== -->
@@ -396,18 +399,23 @@
 
 {% if summary.hit > 0 %}
 <p class="indent">
-  本次审计共发现 <b>{{ summary.hit }}</b> 项税务风险事项，其中高风险 {{ summary.high }} 项、中风险 {{ summary.medium }} 项、低风险 {{ summary.low }} 项。
-  风险事项明细及其依据详见第三部分。
+  本次检查识别 <b>{{ summary.hit }}</b> 项待核查风险线索，其中高关注 {{ summary.high }} 项、中关注 {{ summary.medium }} 项、低关注 {{ summary.low }} 项。
+  明细及其依据详见第三部分；关注等级不等于违法认定或应补税额。
+{% if summary.pass > 0 %}另有 {{ summary.pass }} 项已完成检查未触发核对条件。{% endif %}
+</p>
+{% elif summary.pass > 0 %}
+<p class="indent">
+  本次已完成的 {{ summary.pass }} 项检查未触发设定的核对条件；仅适用于本次材料与规则口径，不代表企业全面无风险。
 </p>
 {% else %}
 <p class="indent">
-  本次审计未发现超出阈值的税务风险事项。
+  本次没有完成可形成判定的检查，不能据此判断是否存在风险。请根据未执行原因补充或核对材料后重检。
 </p>
 {% endif %}
 
 {% if summary.skipped > 0 %}
 <p class="indent muted">
-  另有 {{ summary.skipped }} 项检查因资料不足未能执行，相关事项不构成「已通过」结论，详见第五部分。
+  另有 {{ summary.skipped }} 项检查未能执行，具体原因详见第五部分；相关事项不构成「已通过」结论。
 </p>
 {% endif %}
 
@@ -427,7 +435,7 @@
 </div>
 {% endif %}
 
-<div class="block-label" style="margin-top:5mm">本次执行规则清单（审计范围）</div>
+<div class="block-label" style="margin-top:5mm">本次检查范围与逐项状态</div>
 <table class="data">
   <tr>
     <th style="width:13%">规则编号</th>
@@ -449,8 +457,8 @@
   {% endfor %}
 </table>
 <p class="small muted">
-  上表列示本次审计实际执行的检查规则及其结果。「未执行」表示被审计单位未提供该项检查所需资料，
-  并非检查通过。
+  上表列示本次审计纳入检查范围的规则及其结果。「未执行」可能源于资料缺失、口径不适用或计算条件不足，
+  具体原因见明细，并非检查通过。未命中仅表示本次材料及规则口径下未发现该项异常，不代表企业不存在其他风险。
 </p>
 
 <!-- ======================== 三、风险事项明细 ======================== -->
@@ -497,7 +505,7 @@
   </div>
 
   <div class="block">
-    <div class="block-label">整改建议</div>
+    <div class="block-label">核查建议</div>
     <div class="suggestion">{{ f.suggestion | trim }}</div>
   </div>
 </div>
@@ -519,7 +527,7 @@
 <!-- ======================== 五、未能执行事项 ======================== -->
 {% if skipped_findings %}
 <h2>五、未能执行事项</h2>
-<p class="small muted">下列检查因被审计单位未提供相应资料而未能执行，不构成「已通过」结论，建议补充资料后重新检查。</p>
+<p class="small muted">下列检查未能执行，不构成「已通过」结论；请按逐项列明的证据、口径或适用范围限制核对后重新检查。</p>
 {% for f in skipped_findings %}
 <div class="mini">
   <div class="t">{{ f.id }}　{{ f.name }}</div>
@@ -553,7 +561,7 @@
 </table>
 
 <div class="cover-foot" style="margin-top:10mm">
-  {{ org_name }} · AI 税务审计引擎 v{{ engine_version }}　|　本报告由系统自动生成，共 {{ summary.total }} 项规则判定{% if footer_text %}　|　{{ footer_text }}{% endif %}
+  {{ org_name }} · AI 税务审计引擎 v{{ engine_version }}　|　本报告由系统自动生成，共 {{ summary.total }} 项检查记录{% if footer_text %}　|　{{ footer_text }}{% endif %}
 </div>
 
 </body>

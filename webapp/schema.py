@@ -220,3 +220,5 @@ def initialize(store) -> None:
         classroom.migrate(db)
         mistake_book.migrate(db)
         members.migrate(db)
+        from webapp import material_batches
+        material_batches.migrate(db)

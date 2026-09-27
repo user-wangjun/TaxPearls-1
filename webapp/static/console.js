@@ -50,7 +50,7 @@ function switchPanel(id) {
   if (id !== "notificationPanel") noticeRequest++;
   if (id !== "knowledgePanel" && typeof invalidateGraph === "function") invalidateGraph();
   if (id !== "adminPanel") { ruleEditorRequest++; adminRequest++; }
-  if (id === "uploadPanel") { refreshAIStatus(); refreshAuditClients(); }
+  if (id === "uploadPanel") { refreshAIStatus(); refreshAuditClients(); enterpriseMaterials.refresh(); }
   document.querySelectorAll(".panel").forEach((n) => n.classList.toggle("active", n.id === id));
   document.querySelectorAll("#nav [data-panel]").forEach((n) => n.classList.toggle("active", n.dataset.panel === id));
   if (id === "historyPanel") loadHistory();
@@ -66,6 +66,9 @@ function switchPanel(id) {
 const dz = $("dropzone"), fi = $("fileInput");
 let materialDraft = null, materialCards = [], originalUrls = [];
 let materialRequest = 0;
+const enterpriseMaterials = createEnterpriseMaterials({api, el, $, user:()=>currentUser,
+  clear:clearMaterials, showError, showResult:result=>{renderResult(result);switchPanel("auditPanel");},
+  showReview:()=>switchPanel("uploadPanel")});
 function materialCurrent(request,owner){return request===materialRequest&&currentUser?.id===owner;}
 async function refreshAIStatus() {
   try { const status = await api("/api/materials/config"); $("aiStatus").textContent = status.message; }
@@ -86,6 +89,7 @@ async function refreshAuditClients() {
 $("auditClient").addEventListener("change",()=>{selectedClientId=$("auditClient").value;});
 function clearMaterials() {
   materialRequest++;
+  enterpriseMaterials.reset();
   $("busy").style.display="none";$("busy").textContent="正在处理材料，请稍候……";
   originalUrls.forEach(URL.revokeObjectURL); originalUrls = [];
   materialDraft = null; materialCards = [];
@@ -162,6 +166,7 @@ async function upload(files) {
   if (files.some(f => !/\.(xlsx|xml|pdf|zip)$/i.test(f.name))) return showError("支持 .xlsx、.xml、.pdf 和 .zip 文件。");
   if (files.some(f => !f.size || f.size > 10 * 1024 * 1024)) return showError("单个文件须非空且不超过 10MB。");
   if (files.reduce((n,f) => n+f.size,0) > 50 * 1024 * 1024) return showError("上传总大小不能超过 50MB。");
+  if (enterpriseMaterials.enabled()) return enterpriseMaterials.upload(files);
   clearMaterials();
   const request=materialRequest,owner=currentUser?.id;
   $("coBar").style.display = $("statRow").style.display = $("actions").style.display = $("filterBar").style.display = "none";
@@ -302,6 +307,7 @@ function renderResult(j) {
   $("auditEmpty").style.display = "none";
   auditId = j.audit_id;
   lastResult = j;
+  enterpriseMaterials.renderReference(j);
   snapshotReturn = null;
   $("snapshotBack").hidden = true;
   loadRiskChanges(j.audit_id);
@@ -434,7 +440,7 @@ function findingCard(f) {
 
   /* 未执行：原因置顶 */
   if (f.status === "skipped") {
-    body.appendChild(el("div", "ev-title", "未执行原因（补齐以下材料后可复检）"));
+    body.appendChild(el("div", "ev-title", "未执行原因（请按实际原因核对后复检）"));
     body.appendChild(el("div", "calc-box", f.skip_reason || f.conclusion));
   }
 
@@ -477,7 +483,7 @@ function findingCard(f) {
 
   /* 建议 */
   if (f.status === "hit" && f.suggestion) {
-    body.appendChild(el("div", "ev-title", "整改建议"));
+    body.appendChild(el("div", "ev-title", "核查建议"));
     body.appendChild(el("div", "calc-box", f.suggestion));
   }
 
@@ -998,7 +1004,7 @@ document.querySelector('[data-panel="historyPanel"]').after(orgReportNav);
 orgReportNav.onclick = () => switchPanel("orgReportPanel");
 function orgSummary(data) {
   const t = data.totals;
-  return `所选范围 ${t.clients} 家；有审计 ${t.audited} 家，无匹配审计 ${t.no_audit} 家；有高等级命中 ${t.high} 家、中等级命中 ${t.medium} 家、低等级命中 ${t.low} 家；全部检查通过 ${t.clear} 家，未命中但材料不足 ${t.incomplete} 家；命中 ${t.hit} 条 / 通过 ${t.pass} 条 / 未执行 ${t.skipped} 条。`;
+  return `所选范围 ${t.clients} 家；有审计 ${t.audited} 家，无匹配审计 ${t.no_audit} 家；有高等级命中 ${t.high} 家、中等级命中 ${t.medium} 家、低等级命中 ${t.low} 家；全部检查通过 ${t.clear} 家，未命中但仍有检查未执行 ${t.incomplete} 家；命中 ${t.hit} 条 / 通过 ${t.pass} 条 / 未执行 ${t.skipped} 条。`;
 }
 function orgWarnings(data) {
   const notes = [];
@@ -1498,7 +1504,7 @@ function ruleDraftBody(){
 }
 
 function showRuleTrial(result){
-  const box=$("ruleTrialResult");box.className="rule-trial-result "+result.status;box.textContent="";const labels={hit:"风险命中",pass:"检查通过",skipped:"材料不足"};
+  const box=$("ruleTrialResult");box.className="rule-trial-result "+result.status;box.textContent="";const labels={hit:"风险命中",pass:"检查通过",skipped:"未执行"};
   box.append(el("h3",null,"试跑结果："+(labels[result.status]||result.status)+" · v"+result.version),el("p",null,result.conclusion));
   if(result.calculation)box.append(el("div","calc-box",result.calculation));if(result.skip_reason)box.append(el("p","muted",result.skip_reason));box.hidden=false;
 }

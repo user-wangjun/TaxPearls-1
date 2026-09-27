@@ -14,6 +14,7 @@ from PIL import Image
 from src import render
 from webapp import app as app_module
 from webapp.storage import Store
+from tests.enterprise_support import audit as enterprise_audit, material_key
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ def png(width: int = 160, height: int = 64, color=(20, 96, 170, 255)) -> bytes:
     return output.getvalue()
 
 
+@material_key
 class ReportTemplateSettingsTests(unittest.TestCase):
     def test_stale_actor_cannot_read_or_mutate_branding(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -151,7 +153,7 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                     self.assertIsNotNone(Store(db_path).get_org_logo("org-a"))
 
                     with SAMPLE.open("rb") as stream:
-                        audit = client.post("/api/audit", files={
+                        audit = enterprise_audit(client, files={
                             "file": (SAMPLE.name, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         })
                     self.assertEqual(audit.status_code, 200, audit.text)
@@ -181,7 +183,7 @@ class ReportTemplateSettingsTests(unittest.TestCase):
                         "display_name": "乙机构", "report_title": "乙机构审计报告", "footer_text": "乙方内部",
                     }).status_code, 200)
                     with SAMPLE.open("rb") as stream:
-                        audit = client.post("/api/audit", files={
+                        audit = enterprise_audit(client, files={
                             "file": (SAMPLE.name, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         })
                     self.assertEqual(audit.status_code, 200, audit.text)

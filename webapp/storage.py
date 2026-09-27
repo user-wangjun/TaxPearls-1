@@ -882,7 +882,7 @@ class Store:
     def save_audit(self, audit_id: str, user: dict[str, Any], client_id: str | None,
                    dataset: Dataset, findings: list[Finding], summary: dict[str, Any], audited_at: str,
                    report_snapshot: dict | None = None, exercise_metadata: dict | None = None,
-                   *, create_client: bool = False) -> None:
+                   *, create_client: bool = False, material_context: dict | None = None) -> None:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             current_actor(db, user, {'org_admin', 'accountant', 'teacher'})
@@ -905,6 +905,9 @@ class Store:
                  _json(summary), audited_at),
             )
             self._enqueue_audit_notifications(db, user["org_id"], client_id, audit_id, findings, audited_at)
+            if material_context is not None:
+                from webapp.material_batches import record_execution
+                record_execution(db, user, audit_id, client_id, dataset, findings, material_context)
             if report_snapshot is not None:
                 self._insert_report_version(db, audit_id, user, report_snapshot)
             if exercise_metadata is not None:
@@ -978,6 +981,9 @@ class Store:
         audit = db.execute("SELECT org_id FROM audits WHERE id=?", (audit_id,)).fetchone()
         if not audit or manifest["audit_id"] != audit_id or manifest["org_id"] != audit["org_id"]:
             raise ValueError("归档主体不一致。")
+        from webapp.material_batches import reference
+        if manifest.get('material_reference') != reference(db, audit_id):
+            raise ValueError('报告与材料确认版本关联不一致。')
         manifest_json = canonical(manifest)
         html_hash = digest(html.encode())
         manifest_hash = digest(manifest_json.encode())
@@ -1187,10 +1193,12 @@ class Store:
 
     def get_audit(self, audit_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
+            db.execute('BEGIN')
             row = db.execute("SELECT * FROM audits WHERE id=?", (audit_id,)).fetchone()
-        if not row:
-            return None
-        return self._audit_dict(row)
+            if not row:
+                return None
+            from webapp.material_batches import reference
+            return {**self._audit_dict(row), 'material_reference': reference(db, audit_id)}
 
     @staticmethod
     def _audit_dict(row):
@@ -1204,7 +1212,10 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN')
             row = audit_row(db, audit_id, user)
-            return self._audit_dict(row) if row else None
+            if not row:
+                return None
+            from webapp.material_batches import reference
+            return {**self._audit_dict(row), 'material_reference': reference(db, audit_id)}
 
     def list_audits(self, user: dict[str, Any]) -> list[dict[str, Any]]:
         where, args = audit_scope(user)

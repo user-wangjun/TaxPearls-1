@@ -329,6 +329,15 @@
   .material-review input:not([type=checkbox]), .material-review select { width:100%; padding:8px; border:1px solid #c4cadb; border-radius:5px; min-width:0; font:inherit; font-size:13px; }
   .material-company { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:12px 0; }
   .material-company label { font-size:12px; color:var(--ink-2); }
+  .enterprise-review { overflow-wrap:anywhere; scroll-margin-top:110px; }
+  .enterprise-review fieldset { border:0; padding:0; margin:0; min-width:0; }
+  .enterprise-review pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:360px; overflow:auto; }
+  .enterprise-review .material-card { min-width:0; }
+  .enterprise-feedback { padding:10px 14px; margin:10px 0; border-left:3px solid var(--line); background:#f7f9fc; }
+  .enterprise-feedback.blocking { border-color:#be3c38; }
+  .enterprise-feedback.limited { border-color:#ba8123; }
+  .enterprise-review button:disabled { opacity:.5; cursor:not-allowed; }
+  .enterprise-review .material-table-wrap { max-width:100%; }
   .material-card { border-top:1px solid var(--line); padding:16px 0; }
   .material-card h3 { overflow-wrap:anywhere; font-size:15px; }
   .material-note { color:#996200; font-size:13px; }
@@ -609,7 +618,7 @@
     </section>
     <section class="panel" id="knowledgePanel">
       <div class="page-head graph-page-head"><div><p class="eyebrow">税务洞察 / KNOWLEDGE EXPLORER</p><h2>让每一条关联，都有据可循<span class="graph-title-tag">知识图谱</span></h2><p class="muted">从一个指标出发，探索业务、风险与法规之间的证据网络。</p></div><div id="graphSummary" class="graph-summary"></div></div>
-      <div class="graph-filterbar"><div class="field graph-scope"><label for="graphAudit">探索范围</label><select id="graphAudit"><option value="">规则知识图谱</option></select></div><div class="field graph-search"><label for="knowledgeSearch">搜索关联</label><input id="knowledgeSearch" placeholder="搜索指标、规则、法条、关联主体…"></div><div class="field"><label for="knowledgeCategory">规则类型</label><select id="knowledgeCategory"><option value="">全部类型</option><option>内部勾稽</option><option>外部交叉</option><option>指标偏离</option><option>关联方图</option></select></div><div class="field"><label for="graphStatus">核对状态</label><select id="graphStatus"><option value="">全部状态</option><option value="hit">风险命中</option><option value="skipped">材料不足</option><option value="pass">检查通过</option></select></div></div>
+      <div class="graph-filterbar"><div class="field graph-scope"><label for="graphAudit">探索范围</label><select id="graphAudit"><option value="">规则知识图谱</option></select></div><div class="field graph-search"><label for="knowledgeSearch">搜索关联</label><input id="knowledgeSearch" placeholder="搜索指标、规则、法条、关联主体…"></div><div class="field"><label for="knowledgeCategory">规则类型</label><select id="knowledgeCategory"><option value="">全部类型</option><option>内部勾稽</option><option>外部交叉</option><option>指标偏离</option><option>关联方图</option></select></div><div class="field"><label for="graphStatus">核对状态</label><select id="graphStatus"><option value="">全部状态</option><option value="hit">风险命中</option><option value="skipped">未执行</option><option value="pass">检查通过</option></select></div></div>
       <p id="graphCoverage" class="muted" role="status" hidden></p>
       <div class="graph-workspace">
         <div class="graph-stage"><div class="graph-stage-heading"><div><span class="graph-live-dot"></span><strong>证据关系网络</strong><p id="graphCount"></p></div><span class="graph-mode" id="graphMode">关联视图</span></div><div class="graph-toolbar"><button id="graphOverview">全景</button><button id="graphFocus">聚焦关联</button><button id="graphExpand">展开一层</button><button id="graphZoomIn" aria-label="放大图谱">＋</button><button id="graphZoomOut" aria-label="缩小图谱">−</button><button id="graphReset">居中</button></div><svg id="graphCanvas" viewBox="0 0 960 680" aria-label="交互式知识图谱"></svg><div id="graphLegend" class="graph-legend"></div><p class="graph-hint">滚轮缩放 · 拖动画布或节点 · 点击节点查看证据</p></div>
@@ -627,7 +636,7 @@
         <p class="muted">从工作台进入时会自动带入客户；所选档案的纳税人识别号必须与材料一致。</p>
       </div>
       <label for="extractionMode">数据提取方式</label>
-      <select id="extractionMode" style="padding:8px;margin:8px">
+      <select id="extractionMode" style="padding:8px;margin:8px 0;max-width:100%">
         <option value="auto">自动：已配置时使用 AI 提取 PDF / 非标准 Excel</option>
         <option value="ai">使用 AI 提取（需要配置模型服务）</option>
         <option value="local">仅本地解析</option>
@@ -637,7 +646,7 @@
     <div class="dropzone" id="dropzone">
       <div class="t1">一次选择或拖拽多份 Excel、XML、PDF，也可上传 ZIP 文件包</div>
       <div class="t2">支持账表 Excel、数电发票 XML、来源银行 Excel / 调节底稿、合同四流台账、文字 / 扫描 PDF；AI 候选数据经校验后进入核对页<br>
-        最多 20 份材料，单份 / ZIP 不超过 10MB，解压后合计 50MB · 原始文件仅在内存中解析</div>
+        最多 20 份材料，单份 / ZIP 不超过 10MB，解压后合计 50MB · <span id="materialRetentionHint">企业原件受控留存；教学材料沿用独立核对流程</span></div>
       <button class="pick" type="button">选择多份材料</button>
       <input type="file" id="fileInput" accept=".xlsx,.xml,.pdf,.zip" multiple hidden>
     </div>
@@ -645,6 +654,7 @@
 
     <div id="materialReview" class="material-review" hidden></div>
     <div id="batchResults" class="material-review" hidden></div>
+    <div id="enterpriseHistory" class="material-review enterprise-review" hidden></div>
 
     </section>
     <section class="panel" id="auditPanel">
@@ -664,12 +674,14 @@
       </div>
     </div>
 
+    <section id="auditMaterials" class="material-review enterprise-review" hidden aria-live="polite"></section>
+
     <!-- 统计 -->
     <div class="stat-row" id="statRow">
       <div class="stat hit"><div class="n num" id="nHit">0</div><div class="l">风险命中</div></div>
       <div class="stat"><div class="n num" id="nHigh">0</div><div class="l">其中高风险</div></div>
       <div class="stat pass"><div class="n num" id="nPass">0</div><div class="l">检查通过</div></div>
-      <div class="stat skip"><div class="n num" id="nSkip">0</div><div class="l">未执行（材料不足）</div></div>
+      <div class="stat skip"><div class="n num" id="nSkip">0</div><div class="l">未执行（原因见明细）</div></div>
     </div>
 
     <details class="sheet" id="materialEvidence" hidden></details>
@@ -709,7 +721,7 @@
 
     <!-- 5. 未执行 -->
     <div id="skipSection" style="display:none">
-      <div class="sec-title">未能执行的检查 <span class="cnt">缺数据不等于无风险，请补齐材料后复检</span></div>
+      <div class="sec-title">未能执行的检查 <span class="cnt">未执行不等于通过，请按各项原因核对后复检</span></div>
       <div id="skipList"></div>
     </div>
 
@@ -836,7 +848,8 @@
 
 <script src="/mistake-book.js?v=e11-20260927-1"></script>
 <script src="/classroom.js?v=e11-20260927-1"></script>
-<script src="/console.js?v=materials-review-20260927"></script>
+<script src="/enterprise.js?v=enterprise-20260927-1"></script>
+<script src="/console.js?v=enterprise-review-20260927"></script>
 <script src="/workspace.js?v=dropdown-20260922-1"></script>
 <script src="/graph.js?v=related-20260925-1"></script>
 <script>bootstrap().catch((err) => { showToast(err.message); });</script>

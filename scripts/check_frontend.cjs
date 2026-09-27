@@ -2,6 +2,16 @@
 const fs = require("node:fs");
 const vm = require("node:vm");
 const assert = require("node:assert/strict");
+// Skipped can mean evidence, period, denominator or applicability limits.
+// The shared UI must not translate every skipped result into missing files.
+const indexMarkup = fs.readFileSync("webapp/static/index.html", "utf8");
+assert.ok(indexMarkup.includes('未执行不等于通过，请按各项原因核对后复检'));
+assert.ok(!indexMarkup.includes('value="skipped">材料不足'));
+for (const file of ['console.js', 'graph.js']) {
+  const code = fs.readFileSync('webapp/static/' + file, 'utf8');
+  assert.ok(!code.includes('skipped:"材料不足"'));
+  assert.ok(!code.includes('未命中但材料不足'));
+}
 for (const name of fs.readdirSync("webapp/static").filter(name => name.endsWith(".js"))) {
   new vm.Script(fs.readFileSync("webapp/static/" + name, "utf8"), {filename:name});
 }
@@ -129,7 +139,7 @@ const selection = graph.slice(graph.indexOf("async function loadKnowledge()"), g
   const save=ruleCtx.submitRuleDraft(true);ruleCalls.shift().resolve({id:"R-002",version:"2.1"});await save;
   assert.equal(shown.length,1);assert.ok(ruleCtx.$("ruleEditorStatus").textContent.includes("已保存"));
   const uploadNodes=new Map(),uploadCalls=[],reviews=[],uploadErrors=[];
-  const uploadCtx={currentUser:{id:'u1'},dz:{style:{}},
+  const uploadCtx={currentUser:{id:'u1'},dz:{style:{}},enterpriseMaterials:{enabled:()=>false},
     $:id=>{if(!uploadNodes.has(id))uploadNodes.set(id,{...node(),style:{},value:'local'});return uploadNodes.get(id);},
     FormData:class{append(){}},hideError(){},showError:e=>uploadErrors.push(e),
     api:()=>new Promise((resolve,reject)=>uploadCalls.push({resolve,reject})),
@@ -146,6 +156,8 @@ const selection = graph.slice(graph.indexOf("async function loadKnowledge()"), g
   const upload4=uploadCtx.upload([{name:'last.xlsx',size:10}]);uploadCalls.shift().resolve({token:'last'});await upload4;
   oldFailure.reject(new Error('old upload error'));await upload3;
   assert.deepEqual(reviews,['new','last']);assert.equal(uploadErrors.length,0);
+  let routed=0;uploadCtx.enterpriseMaterials={enabled:()=>true,upload:async()=>routed++};
+  await uploadCtx.upload([{name:'enterprise.xlsx',size:10}]);assert.equal(routed,1);assert.equal(uploadCalls.length,0);
   const evidenceBox=node();
   const evidenceCtx={$:()=>evidenceBox,el:(tag,cls,text)=>({...node(),tag,textContent:text||""})};
   vm.createContext(evidenceCtx);
