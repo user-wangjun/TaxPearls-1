@@ -266,6 +266,47 @@ def _logic(logic, dataset, rule):
     return value > limit, value, f"{calc}；阈值 > {limit}", desc
 
 
+def readiness(rule: Rule, dataset: Dataset) -> list[str]:
+    """Check input availability/calculability only, without determining risk.
+
+    Unlike evaluate/_logic this never compares measured results with risk
+    thresholds and never constructs a Finding. Shared expression evaluation
+    keeps zero denominators and invalid references consistent with execution.
+    """
+    problems = []
+    for key in rule.inputs:
+        try:
+            _need(dataset, key, rule)
+        except MissingMetric as exc:
+            problems.append(str(exc))
+    if problems:
+        return problems
+
+    def check(logic):
+        kind = logic['type']
+        if kind == 'all':
+            for child in logic['conditions']:
+                check(child)
+            return
+        if kind == 'ratio_range':
+            _expr({'div': [logic['numerator'], logic['denominator']]}, dataset, rule)
+            lo = _expr(logic['min'], dataset, rule)[0]
+            hi = _expr(logic['max'], dataset, rule)[0]
+            if lo > hi:
+                raise MissingMetric('参考区间下限大于上限，请复核参考值来源')
+        else:
+            _expr(logic['left'], dataset, rule)
+            right = _expr(logic['right'], dataset, rule)[0]
+            if kind == 'deviation' and right <= 0:
+                raise MissingMetric('相对偏离度基数必须大于零；零值/负值须人工核对或使用绝对差额规则')
+
+    try:
+        check(rule.logic)
+    except MissingMetric as exc:
+        problems.append(str(exc))
+    return problems
+
+
 def evaluate(rule: Rule, dataset: Dataset) -> Finding:
     try:
         evidence = []

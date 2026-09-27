@@ -57,6 +57,17 @@ def selections(docs, reviewed=True):
 
 
 class MaterialParsing(unittest.TestCase):
+    def test_local_parser_provenance_and_full_fingerprint_include_failed_documents(self):
+        import hashlib
+        raw = accounts()
+        good, bad = materials.preview([('good.xlsx', raw), ('bad.xlsx', b'broken')], KEYS)
+        self.assertEqual(good['sha256'], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(good['extraction']['local']['status'], 'succeeded')
+        self.assertEqual(bad['extraction']['local']['status'], 'failed')
+        self.assertEqual(good['extraction']['local']['program'], bad['extraction']['local']['program'])
+        self.assertEqual(len(good['extraction']['local']['program']['sources']['materials.py']), 64)
+        self.assertIn('openpyxl', good['extraction']['local']['program']['dependencies'])
+
     def test_pdf_text_tables_zero_page_and_ambiguous_columns(self):
         doc = materials.preview([("税表.pdf", (FIXTURES / "materials-text.pdf").read_bytes())], KEYS)[0]
         self.assertEqual(doc["error"], "")
@@ -140,11 +151,12 @@ class MaterialParsing(unittest.TestCase):
 
 
 class MaterialWebFlow(unittest.TestCase):
+    """Legacy multi-case teaching import; enterprises use one persisted group."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.old_store = app_module.store
         app_module.store = Store(Path(self.temp.name) / "test.db")
-        app_module.store.create_user("admin", "material-test-2026", "测试管理", "org_admin", "default")
+        app_module.store.create_user("admin", "material-test-2026", "测试教师", "teacher", "default")
         self.client = TestClient(app_module.app)
         self.client.post("/api/login", json={"username":"admin", "password":"material-test-2026"})
 
@@ -243,7 +255,7 @@ class MaterialWebFlow(unittest.TestCase):
         draft = self.preview([("a.xlsx", accounts())])
         self.client.post("/api/logout")
         self.assertEqual(self.commit(draft).status_code, 401)
-        app_module.store.create_user("other", "material-test-2026", "其他管理员", "org_admin", "default")
+        app_module.store.create_user("other", "material-test-2026", "其他教师", "teacher", "default")
         self.client.post("/api/login", json={"username":"other", "password":"material-test-2026"})
         self.assertEqual(self.commit(draft).status_code, 422)
         self.client.post("/api/logout")

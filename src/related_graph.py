@@ -172,10 +172,46 @@ def candidate_paths(dataset: Dataset) -> Iterator[tuple[RelatedRelation, Related
                     yield share, control, trade
 
 
-def run(dataset: Dataset) -> list[Finding]:
+MISSING_GRAPH = '未提供关联方主体、关系及交易证据。'
+MISSING_CHAIN = '未取得完整且已复核的股东→控制企业→两企业交易证据链。'
+UNREVIEWED_TRADE = '已发现关联交易，但交易未复核或缺少异常依据，不能判定为异常。'
+
+
+def definition() -> Rule:
+    """Serializable definition shared by scope review and graph execution.
+
+    Change this version when the traversal/evidence contract changes. Unlike
+    YAML, executable historical graph algorithms are not kept: pending inputs
+    with a different definition must be reanalyzed, never silently upgraded.
+    """
+    return Rule(
+        id="G-001", name="关联方异常交易线索", category="关联方图", tax_type="企业所得税",
+        severity="medium", logic={}, evidence=[], legal_basis=[],
+        suggestion="核实控制关系、交易真实性与定价公允性；当前结果只是待核查线索，不直接认定违法。",
+        description="独立图遍历：被审计企业的股东控制其他公司，且两公司有经复核的异常交易线索。",
+        source_file="src/related_graph.py", version="1.0",
+    )
+
+
+def readiness(dataset: Dataset) -> list[str]:
+    """Check available/reviewed evidence only; never emit a risk Finding."""
+    if dataset.related_graph is None:
+        return [MISSING_GRAPH]
+    has_path = False
+    for _share, _control, trade in candidate_paths(dataset):
+        has_path = True
+        if trade.reviewed and trade.anomaly_basis:
+            return []
+    return [UNREVIEWED_TRADE if has_path else MISSING_CHAIN]
+
+
+def run(dataset: Dataset, *, include_unavailable: bool = False) -> list[Finding]:
     """Traverse a reviewed A <- shareholder -> controlled B -> A/B trade path."""
     graph = dataset.related_graph
     if graph is None:
+        if include_unavailable:
+            return [Finding(definition(), 'skipped', None, '需完整证据链', '关联方图规则未执行。',
+                            skip_reason=MISSING_GRAPH)]
         return []
     subjects = {item.key: item for item in graph.subjects}
     audited = next(item for item in graph.subjects if item.taxpayer_id == dataset.company.taxpayer_id)
@@ -195,18 +231,11 @@ def run(dataset: Dataset) -> list[Finding]:
             EvidenceItem("控制关系", f"{owner.name} → {other.name}；{control.start_on} 至 {control.end_on or '持续'}", control.source + "；" + control.basis),
             EvidenceItem("关联交易待核查线索", f"{trade.key} {trade.amount:,.2f} 元；{trade.anomaly_basis}", trade.source),
         ])
-    rule = Rule(
-        id="G-001", name="关联方异常交易线索", category="关联方图", tax_type="企业所得税",
-        severity="medium", logic={}, evidence=[], legal_basis=[],
-        suggestion="核实控制关系、交易真实性与定价公允性；当前结果只是待核查线索，不直接认定违法。",
-        description="独立图遍历：被审计企业的股东控制其他公司，且两公司有经复核的异常交易线索。",
-        source_file="src/related_graph.py", version="1.0",
-    )
+    rule = definition()
     if hit_count:
         return [Finding(rule, "hit", None, "经复核的关系链与交易异常依据",
                         f"发现 {hit_count} 条关联方交易关系路径存在待核查异常线索，不等于违法认定。",
                         evidence, f"股东→控制企业→两企业交易，命中 {hit_count} 条路径；证据最多展示前 20 条")]
-    reason = ("已发现关联交易，但交易未复核或缺少异常依据，不能判定为异常。" if path_count else
-              "未取得完整且已复核的股东→控制企业→两企业交易证据链。")
+    reason = UNREVIEWED_TRADE if path_count else MISSING_CHAIN
     return [Finding(rule, "skipped", None, "需完整证据链", "关联方图规则未执行。",
                     skip_reason=reason)]

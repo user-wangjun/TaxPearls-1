@@ -15,10 +15,14 @@ import pypdfium2
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .settings import AISettings
+from . import material_provenance as provenance
 
 
 class ExtractionError(Exception):
-    pass
+    def __init__(self, message, *, code='invalid_evidence'):
+        super().__init__(message)
+        self.code = code if code in {'invalid_evidence', 'configuration', 'limit',
+            'http', 'timeout', 'network', 'oversized', 'incomplete', 'schema', 'empty'} else 'invalid_evidence'
 
 
 class Row(BaseModel):
@@ -45,12 +49,12 @@ def call_model(settings, messages, timeout):
     except TransportError as exc:
         if exc.kind == "http":
             hints = {401: "密钥无效", 403: "接口无权限", 404: "地址或模型名不存在", 429: "限流或额度不足"}
-            raise ExtractionError(f"AI 接口失败：HTTP {exc.status}（{hints.get(exc.status, '请检查接口配置')}）。未自动重试。") from None
+            raise ExtractionError(f"AI 接口失败：HTTP {exc.status}（{hints.get(exc.status, '请检查接口配置')}）。未自动重试。", code='http') from None
         errors = {"timeout":"AI 提取超时，未自动重试。", "network":"AI 服务无法连接，请检查网络和证书。",
                   "oversized":"AI 响应超过 2MB，已拒绝。", "incomplete":"AI 输出未完整结束，本次结果未采用。"}
-        raise ExtractionError(errors.get(exc.kind, "AI 返回的 JSON 不符合提取契约，本次结果未采用。")) from None
+        raise ExtractionError(errors.get(exc.kind, "AI 返回的 JSON 不符合提取契约，本次结果未采用。"), code=exc.kind) from None
     except ValidationError:
-        raise ExtractionError("AI 返回的 JSON 不符合提取契约，本次结果未采用。") from None
+        raise ExtractionError("AI 返回的 JSON 不符合提取契约，本次结果未采用。", code='schema') from None
 
 
 def _compact(text):
@@ -112,21 +116,49 @@ class AIExtractor:
         self.settings, self.catalog, self.transport = settings, catalog, transport or call_model
         self.deadline = time.monotonic() + settings.batch_timeout
         self.calls = 0
+        self.program = provenance.program('ai')
 
     def enrich(self, doc, data):
+        before = self.calls
+        local = deepcopy(doc.get('extraction', {}).get('local'))
+        meta = {'method': 'ai', 'status': 'running', 'model': self.settings.effective_model,
+                # A requested alias is not proof of the provider's actual model revision.
+                'resolved_model_version': None, 'program': deepcopy(self.program),
+                'prompt_sha256': provenance.digest(SYSTEM),
+                'schema_sha256': provenance.digest(Extraction.model_json_schema()),
+                'catalog_sha256': provenance.digest(self.catalog),
+                'service_fingerprint': provenance.digest(self.settings.base_url) if not self.settings.problem() else None,
+                'vision': self.settings.vision,
+                'request_options': {'temperature': 0, 'max_tokens': self.settings.max_tokens,
+                    'json_mode': self.settings.json_mode, 'disable_thinking': self.settings.disable_thinking},
+                'started_at': provenance.now(), 'attempts': []}
+        if local is not None:
+            meta['local'] = local
+        doc['extraction'] = meta
+        try:
+            self._enrich(doc, data)
+        except Exception as exc:
+            meta.update(method='ai_failed', status='failed',
+                        failure_code=exc.code if isinstance(exc, ExtractionError) else 'internal')
+            raise
+        else:
+            meta['status'] = 'succeeded'
+        finally:
+            meta.update(calls=self.calls - before, batch_calls_after=self.calls, finished_at=provenance.now())
+
+    def _enrich(self, doc, data):
         if self.settings.problem():
-            raise ExtractionError(self.settings.problem())
+            raise ExtractionError(self.settings.problem(), code='configuration')
         if len(doc["pages"]) > self.settings.max_pages:
-            raise ExtractionError(f"本次 AI 单文件最多 {self.settings.max_pages} 页/工作表；请拆分材料。")
+            raise ExtractionError(f"本次 AI 单文件最多 {self.settings.max_pages} 页/工作表；请拆分材料。", code='limit')
         if not self.settings.vision and any(not p["text"].strip() for p in doc["pages"]):
             raise ExtractionError("文件含扫描页，当前未启用视觉输入；请启用 AI_VISION 或补录。")
         company, rows, warnings = deepcopy(doc["company"]), [], []
-        usage_model = self.settings.effective_model
         # Small chunks avoid huge multimodal requests. Commit only after every chunk succeeds.
         for start in range(0, len(doc["pages"]), 3):
             pages = doc["pages"][start:start + 3]
             if self.calls >= self.settings.max_calls or time.monotonic() >= self.deadline:
-                raise ExtractionError("本批 AI 调用次数或总时长超限，请减少材料后重试。")
+                raise ExtractionError("本批 AI 调用次数或总时长超限，请减少材料后重试。", code='limit')
             if sum(len(p["text"]) for p in pages) > 60000:
                 raise ExtractionError("AI 单批原文超过 60000 字符，请拆分材料。")
             text = json.dumps({"allowed_metrics": self.catalog, "pages": pages}, ensure_ascii=False)
@@ -151,8 +183,20 @@ class AIExtractor:
                             content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode()}})
                             image_pages.add(p["page"])
             self.calls += 1
-            response = self.transport(self.settings, [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}],
-                                      max(1, min(self.settings.timeout, self.deadline - time.monotonic())))
+            attempt = {'pages': [p['page'] for p in pages], 'image_pages': sorted(image_pages),
+                       'status': 'started', 'started_at': provenance.now()}
+            doc['extraction']['attempts'].append(attempt)
+            try:
+                response = self.transport(self.settings, [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}],
+                                          max(1, min(self.settings.timeout, self.deadline - time.monotonic())))
+            except Exception as exc:
+                attempt.update(status='failed', failure_code=exc.code if isinstance(exc, ExtractionError) else 'internal')
+                raise
+            else:
+                # Received does not mean accepted: validation below can still fail.
+                attempt['status'] = 'response_received'
+            finally:
+                attempt['finished_at'] = provenance.now()
             if set(response.company) - set(company) or any(v is not None and len(v) > 200 for v in response.company.values()):
                 raise ExtractionError("AI 企业信息字段不符合契约。")
             for key, value in response.company.items():
@@ -205,8 +249,7 @@ class AIExtractor:
             if len(values_by_name.get(row["name"], ())) > 1:
                 row["ai_issues"].append("同一指标存在不同候选值，须核实本期/累计栏次及口径后删除或修正冲突行")
         doc.update(company=company, rows=list(unique.values()), review_required=True)
-        doc["extraction"] = {"method": "ai", "model": usage_model, "calls": self.calls,
-                             "needs_attention": sum(bool(r["ai_issues"]) for r in unique.values())}
+        doc['extraction']['needs_attention'] = sum(bool(r['ai_issues']) for r in unique.values())
         doc["warnings"] = ["AI 已生成候选数据；金额由程序按原始单位换算。请重点复核标注的疑点，并确认企业与核对期。"] + warnings
         doc["summary"] = f"AI 提取 {len(unique)} 项候选指标，其中 {doc['extraction']['needs_attention']} 项需重点核对"
 

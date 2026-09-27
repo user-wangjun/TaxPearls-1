@@ -157,7 +157,7 @@ class Finding:
     status 取值：
         hit      -- 命中风险
         pass     -- 已执行，未发现异常
-        skipped  -- 材料不足，未能执行（不算通过，须在报告中明示）
+        skipped  -- 因证据、口径或适用范围等限制未能执行（不算通过，须明示实际原因）
     """
 
     rule: Rule

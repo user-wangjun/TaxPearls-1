@@ -171,7 +171,7 @@ def _number(value, location):
     return number
 
 
-def _read_company(wb):
+def _read_company(wb, *, allow_incomplete=False):
     ws = _sheet(wb, config.SHEET_COMPANY, ["项目", "内容"])
     data = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -182,9 +182,9 @@ def _read_company(wb):
             raise InputError(f"企业信息项目重复：{key}")
         data[key] = "" if row[1] is None else str(row[1]).strip()
     missing = [key for key in config.COMPANY_FIELDS if not data.get(key)]
-    if missing:
+    if missing and not allow_incomplete:
         raise InputError(f"企业信息缺少字段：{missing}")
-    return Company(*(data[k] for k in config.COMPANY_FIELDS))
+    return Company(*(data.get(k, '') for k in config.COMPANY_FIELDS))
 
 
 def _read_accounts(wb):

@@ -14,7 +14,8 @@ from zipfile import ZipFile, BadZipFile
 
 import pdfplumber
 
-from . import config, loader, related_graph
+from . import config, loader, related_graph, material_review
+from . import material_provenance as provenance
 from .models import (
     Account, Company, Dataset, Metric, RelatedGraph, RelatedRelation,
     RelatedSubject, RelatedTrade,
@@ -92,7 +93,7 @@ def expand_uploads(files):
     return output
 
 
-def _excel(data, doc):
+def _excel(data, doc, *, allow_incomplete_company=False, capture_standard=False):
     try:
         wb = open_workbook(data)
     except ValueError as exc:
@@ -100,7 +101,7 @@ def _excel(data, doc):
     try:
         company = Company("", "", "", "")
         if config.SHEET_COMPANY in wb.sheetnames:
-            company = loader._read_company(wb)
+            company = loader._read_company(wb, allow_incomplete=allow_incomplete_company)
         elif config.SHEET_SUPPLEMENT in wb.sheetnames:
             ws = loader._sheet(wb, config.SHEET_SUPPLEMENT, config.COL_SUPPLEMENT)
             periods = {_text(row[3]) for row in ws.iter_rows(min_row=2, values_only=True) if row[0] is not None}
@@ -123,9 +124,11 @@ def _excel(data, doc):
         contract_links = loader._read_contract_links(wb)
         graph = related_graph.read_workbook(wb, company)
         loader._read_supplement(wb, company, metrics)
+        tables = material_review.capture(wb) if capture_standard else {}
+        reviewable = material_review.fields({'standard_tables': tables})
         if (not accounts and not declarations and not metrics and not period_series and not invoices
                 and not bank_transactions and not bank_adjustments and not human_records
-                and not contracts and not fulfillments and not contract_links and graph is None):
+                and not contracts and not fulfillments and not contract_links and graph is None and not reviewable):
             raise InputError("没有找到支持的账表；请保留标准工作表名称和列名。")
         serialized_series = [
             {
@@ -148,6 +151,9 @@ def _excel(data, doc):
                    fulfillments=_serial([asdict(item) for item in fulfillments]),
                    contract_links=_serial([asdict(item) for item in contract_links]),
                    related_graph=_serial(asdict(graph)) if graph else None)
+        if capture_standard:
+            doc['standard_tables'] = tables
+            material_review.annotate(doc, tables, {})
         doc["summary"] = (
             f"{len(accounts)} 行科目、{len(declarations)} 项申报、{len(metrics)} 项补充/报表指标、"
             f"{len(serialized_series)} 条期间序列、{len(invoices)} 张发票、"
@@ -385,46 +391,61 @@ def _unmapped_excel(data, doc):
         wb.close()
 
 
-def preview(files, keys, extractor=None):
+def preview(files, keys, extractor=None, *, allow_incomplete_company=False, capture_standard=False):
     docs = []
+    parser = provenance.program('local')
     for index, (name, data) in enumerate(expand_uploads(files)):
         suffix = name.lower().rsplit(".", 1)[-1] if "." in name else ""
         doc = {"id": str(index), "name": name, "fingerprint": sha256(data).hexdigest()[:16],
+               "sha256": sha256(data).hexdigest(),
                "kind": suffix, "company": dict.fromkeys(COMPANY_KEYS, ""),
                "accounts": [], "declarations": {}, "rows": [], "period_series": [], "invoices": [],
                 "bank_transactions": [], "bank_adjustments": [],
                 "human_records": [], "contracts": [], "fulfillments": [], "contract_links": [],
                 "related_graph": None,
                "pages": [], "warnings": [], "error": "",
-               "extraction": {"method": "local"}}
+               "extraction": {"method": "local", 'local': {
+                   'program': parser, 'status': 'running', 'started_at': provenance.now()}}}
+        local = doc['extraction']['local']
         try:
             if name.lower().endswith(".xlsx"):
                 try:
-                    _excel(data, doc)
+                    _excel(data, doc, allow_incomplete_company=allow_incomplete_company, capture_standard=capture_standard)
                 except InputError:
+                    local.update(status='failed', finished_at=provenance.now())
                     if extractor is None:
                         raise
                     _unmapped_excel(data, doc)
+                    local['fallback'] = 'unmapped_workbook_text'
                     extractor.enrich(doc, data)
             elif name.lower().endswith(".xml"):
                 _xml(data, doc)
             elif name.lower().endswith(".pdf"):
                 _pdf(data, doc, keys)
+                local.update(status='succeeded', finished_at=provenance.now())
                 if extractor is not None:
                     try:
                         extractor.enrich(doc, data)
                     except ExtractionError as exc:
-                        doc["extraction"] = {"method": "ai_failed"}
+                        doc['extraction']['method'] = 'ai_failed'
                         doc["warnings"].insert(0, f"AI 未完成：{exc} 当前仅显示本地解析候选，需人工核对或重新上传。")
             else:
                 raise InputError("不支持此文件类型；请选择 .xlsx、.xml 或 .pdf（也可放入 ZIP）。")
         except InputError as exc:
             doc["error"] = str(exc)
+            if local['status'] == 'running':
+                local['status'] = 'failed'
         except ExtractionError as exc:
             doc["error"] = f"AI 提取失败：{exc}"
-            doc["extraction"] = {"method": "ai_failed"}
+            doc['extraction']['method'] = 'ai_failed'
         except Exception:
             doc["error"] = "文件无法解析；请检查是否损坏、加密或格式不符。"
+            if local['status'] == 'running':
+                local['status'] = 'failed'
+        finally:
+            if local['status'] == 'running':
+                local['status'] = 'succeeded'
+            local.setdefault('finished_at', provenance.now())
         docs.append(doc)
     return docs
 
@@ -687,10 +708,13 @@ def build_dataset(documents, selections, company_override, keys):
         for row in doc["accounts"]:
             account = Account(row["code"], row["name"], *(loader._number(row[k], source) for k in ("opening", "debit", "credit", "closing")))
             _merge_value(accounts, account.code, account, source)
-            account_sources.setdefault(account.code, []).append(source)
+            for side in ('opening', 'debit', 'credit', 'closing'):
+                location = doc.get('account_cell_sources', {}).get(account.code, {}).get(side, '')
+                account_sources.setdefault((account.code, side), []).append(source + (' / ' + location if location else ''))
         for key, val in doc["declarations"].items():
             _merge_value(declarations, key, loader._number(val, source), source)
-            declaration_sources.setdefault(key, []).append(source)
+            location = doc.get('declaration_cell_sources', {}).get(key, '')
+            declaration_sources.setdefault(key, []).append(source + (' / ' + location if location else ''))
         rows = doc["rows"]
         if editable:
             if selection.get("reviewed") is not True:
@@ -739,7 +763,8 @@ def build_dataset(documents, selections, company_override, keys):
     derived = loader._build_metrics(list(accounts.values()), declarations)
     for key, metric in derived.items():
         if key in config.ACCOUNT_MAP:
-            sources = [s for code in config.ACCOUNT_MAP[key]["accounts"] for s in account_sources[code]]
+            sources = [s for code in config.ACCOUNT_MAP[key]["accounts"]
+                       for s in account_sources[(code, config.ACCOUNT_MAP[key]['side'])]]
         else:
             sources = declaration_sources[config.DECLARATION_ITEMS[key]]
         metric.source = "；".join(dict.fromkeys(sources)) + " / " + metric.source

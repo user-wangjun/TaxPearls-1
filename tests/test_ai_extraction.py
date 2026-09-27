@@ -46,6 +46,66 @@ def envelope(content, finish="stop"):
 
 
 class AIContractTests(unittest.TestCase):
+    def test_extraction_provenance_is_per_file_and_contains_no_credentials(self):
+        extractor = AIExtractor(SETTINGS, CATALOG, lambda *_: answer([row()]))
+        first, second = document(), document()
+        extractor.enrich(first, b"")
+        extractor.enrich(second, b"")
+        for doc in (first, second):
+            meta = doc['extraction']
+            self.assertEqual(meta['calls'], 1)
+            self.assertEqual(meta['status'], 'succeeded')
+            self.assertEqual(meta['model'], SETTINGS.effective_model)
+            self.assertIsNone(meta['resolved_model_version'])
+            self.assertEqual(len(meta['prompt_sha256']), 64)
+            self.assertEqual(len(meta['schema_sha256']), 64)
+            self.assertEqual(len(meta['catalog_sha256']), 64)
+            self.assertEqual(meta['attempts'][0]['pages'], [1])
+            self.assertEqual(meta['attempts'][0]['status'], 'response_received')
+            self.assertNotIn(SETTINGS.api_key, json.dumps(meta))
+            self.assertNotIn('api_key', json.dumps(meta))
+        self.assertEqual(second['extraction']['batch_calls_after'], 2)
+        self.assertEqual(first['extraction']['batch_calls_after'], 1)
+
+    def test_failure_provenance_survives_fallback_and_contains_safe_error_code(self):
+        extractor = AIExtractor(SETTINGS, CATALOG, Mock(side_effect=ExtractionError('synthetic-secret', code='timeout')))
+        doc = materials.preview([('text.pdf', (FIXTURES/'materials-text.pdf').read_bytes())], set(CATALOG), extractor)[0]
+        meta = doc['extraction']
+        self.assertEqual(meta['method'], 'ai_failed')
+        self.assertEqual(meta['status'], 'failed')
+        self.assertEqual(meta['failure_code'], 'timeout')
+        self.assertEqual(meta['calls'], 1)
+        self.assertEqual(meta['attempts'][0]['status'], 'failed')
+        self.assertEqual(meta['local']['status'], 'succeeded')
+        self.assertNotIn('synthetic-secret', json.dumps(meta))
+        self.assertTrue(doc['rows'])
+
+    def test_partial_response_and_preflight_failure_are_not_successful_extraction(self):
+        transport = Mock(side_effect=[answer([row()]), ExtractionError('timeout', code='timeout')])
+        doc = document(pages=[{'page': i, 'text': '销售额 10'} for i in range(1, 5)])
+        with self.assertRaises(ExtractionError):
+            AIExtractor(SETTINGS, CATALOG, transport).enrich(doc, b'')
+        self.assertEqual(doc['rows'], [])
+        self.assertEqual(doc['extraction']['calls'], 2)
+        self.assertEqual(doc['extraction']['status'], 'failed')
+        self.assertEqual([a['status'] for a in doc['extraction']['attempts']], ['response_received', 'failed'])
+        blocked = document()
+        with self.assertRaises(ExtractionError):
+            AIExtractor(replace(SETTINGS, enabled=False), CATALOG, transport).enrich(blocked, b'')
+        self.assertEqual(blocked['extraction']['calls'], 0)
+        self.assertEqual(blocked['extraction']['attempts'], [])
+        self.assertEqual(blocked['extraction']['failure_code'], 'configuration')
+
+    def test_contract_fingerprints_change_with_prompt_and_catalog_not_secret(self):
+        first = document()
+        AIExtractor(SETTINGS, CATALOG, lambda *_: answer([])).enrich(first, b'')
+        changed = document()
+        with patch('src.ai_extraction.SYSTEM', 'different contract'):
+            AIExtractor(replace(SETTINGS, api_key='different-secret'), {**CATALOG, 'new': 'definition'}, lambda *_: answer([])).enrich(changed, b'')
+        for key in ('prompt_sha256', 'catalog_sha256'):
+            self.assertNotEqual(first['extraction'][key], changed['extraction'][key])
+        self.assertEqual(first['extraction']['schema_sha256'], changed['extraction']['schema_sha256'])
+
     def test_alias_config_and_no_secret_in_public_status(self):
         self.assertEqual(SETTINGS.effective_model, "deepseek-flash")
         proxy = replace(SETTINGS, base_url="https://gateway.example/v1")
@@ -209,7 +269,7 @@ class AIWebTests(unittest.TestCase):
             old = app_module.store
             app_module.store = Store(Path(td)/"ai.db")
             try:
-                app_module.store.create_user("aiadmin", "ai-test-pass-2026", "AI测试", "org_admin", "default")
+                app_module.store.create_user("aiadmin", "ai-test-pass-2026", "AI教学测试", "teacher", "default")
                 with TestClient(app_module.app) as client, patch("webapp.material_upload.AISettings.from_env", return_value=replace(SETTINGS,vision=True)), patch("src.ai_extraction.call_model", return_value=answer([row("100000","元","增值税.销售额：100000")])):
                     client.post("/api/login",json={"username":"aiadmin","password":"ai-test-pass-2026"})
                     status = client.get("/api/materials/config")
@@ -225,7 +285,7 @@ class AIWebTests(unittest.TestCase):
                     self.assertEqual(len(result.json()["results"]),1,result.text)
                     client.post("/api/logout")
                     self.assertEqual(client.get(url).status_code,401)
-                    app_module.store.create_user("otherai", "ai-test-pass-2026", "其他", "org_admin", "default")
+                    app_module.store.create_user("otherai", "ai-test-pass-2026", "其他教师", "teacher", "default")
                     client.post("/api/login",json={"username":"otherai","password":"ai-test-pass-2026"})
                     self.assertEqual(client.get(url).status_code,404)
             finally:
