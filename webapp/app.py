@@ -170,7 +170,7 @@ class RegisterCompleteBody(BaseModel):
 class InviteBody(BaseModel):
     """创始码只捆机构名称：一码一位、私聊交付，邮箱不绑定（注册侧有邮箱验证码兜底）。"""
     org_name: str = Field(min_length=1, max_length=120)
-    seats: int = Field(default=1, ge=1, le=200)
+    seats: int = Field(default=5, ge=1, le=200)
     bound_email: str = ""
     expires_days: int = Field(default=7, ge=1, le=30)
 
