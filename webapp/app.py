@@ -37,7 +37,7 @@ from src.models import Dataset, Rule
 from webapp import captcha, classroom, members, email_auth
 from webapp.access import AccessDenied
 from webapp.notifications import NotificationWorker, email_delivery_enabled
-from webapp.storage import SetupAlreadyInitialized, Store
+from webapp.storage import SetupAlreadyInitialized, Store, session_max_age
 from webapp.login_guard import LoginGuard, RateLimiter
 from webapp.knowledge import (
     ai_config, ask_graph, audit_narrative_hash, build_graph,
@@ -118,6 +118,7 @@ class SetupBody(BaseModel):
 class LoginBody(BaseModel):
     username: str
     password: str
+    remember: bool = False
 
 
 class UserBody(BaseModel):
@@ -692,18 +693,18 @@ def login(body: LoginBody, request: Request) -> Response:
         if wait:
             return JSONResponse(status_code=429, content={"detail": "登录尝试过于频繁，请稍后重试。"},
                                 headers={"Retry-After": str(wait)})
-        result = store.authenticate(body.username, body.password)
+        result = store.authenticate(body.username, body.password, remember=body.remember)
         if not result:
             count = login_guard.record_failure(body.username, ip)
             store.log(None, "login_failed", "account_hash", login_guard.fingerprint(body.username.strip().lower()),
                       f"ip_hash={login_guard.fingerprint(ip)};failure_count={count}")
-            return _err(401, "用户名或密码错误。")
+            return _err(401, "邮箱、用户名或密码错误。")
         user, token = result
         login_guard.record_success(body.username)
     store.log(user, "login", "session", user["id"])
     response = JSONResponse({"user": user})
     response.set_cookie(
-        COOKIE_NAME, token, max_age=12 * 3600, httponly=True,
+        COOKIE_NAME, token, max_age=session_max_age(body.remember), httponly=True,
         samesite="strict", secure=os.environ.get("TAXPEARLS_COOKIE_SECURE") == "1",
     )
     return response

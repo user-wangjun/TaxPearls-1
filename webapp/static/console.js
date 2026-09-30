@@ -629,7 +629,7 @@ async function bootstrap() {
   if (pendingEmailToken && !setup) return showAuthView("emailMagic");
   if (s.user) return enterApp(s.user);
   if (inviteCode && !setup) return showAuthView("signup");
-  showAuthView(setup ? "login" : "emailLogin");
+  showAuthView("login");
 }
 
 const authViews = ["viewLogin", "viewForgot", "viewReset", "viewSignup", "viewEmailLogin", "viewEmailMagic"];
@@ -650,6 +650,11 @@ function showAuthView(view) {
   const form = $("authForm");
   const setup = form.dataset.setup === "1";
   const [title, submitText, step] = authViewLabels[view] || authViewLabels.login;
+  $("loginUserLabel").textContent = setup ? "用户名" : "邮箱（兼容原用户名）";
+  $("loginUser").placeholder = setup ? "设置管理员用户名" : "name@example.com";
+  $("loginUser").inputMode = setup ? "text" : "email";
+  $("loginRememberField").hidden = setup || view !== "login";
+  $("loginRemember").disabled = setup || view !== "login";
   (view==="emailLogin"?$("emailLoginVerification"):$("viewSignup")).append($("emailVerificationFields"));
   authViews.forEach((id) => {
     const on = id === authViewMap[view];
@@ -686,7 +691,7 @@ $("forgotLink").addEventListener("click", () => showAuthView("forgot"));
 $("signupEntryLink").addEventListener("click", () => {emailRegistrationProof=null;showAuthView("signup");});
 $("emailLoginEntryLink").addEventListener("click",()=>showAuthView("emailLogin"));
 $("passwordLoginEntryLink").addEventListener("click",()=>showAuthView("login"));
-$("backToLogin").addEventListener("click", () => {emailRegistrationProof=null;authResetProof="";pendingEmailToken="";showAuthView("emailLogin");});
+$("backToLogin").addEventListener("click", () => {emailRegistrationProof=null;authResetProof="";pendingEmailToken="";showAuthView("login");});
 
 let captchaBusy = false;
 async function loadCaptcha() {
@@ -791,7 +796,7 @@ $("authForm").addEventListener("submit", async (e) => {
       if(version!==authViewVersion)return;
       history.replaceState(null, "", location.pathname);
       authResetProof="";$("newPass").value="";$("newPass2").value="";
-      showAuthView("emailLogin");
+      showAuthView("login");
       showToast("密码已重置，请使用新密码登录。", "success");
       return;
     }
@@ -806,7 +811,7 @@ $("authForm").addEventListener("submit", async (e) => {
       return;
     }
     const setup = form.dataset.setup === "1";
-    const body = {username: $("loginUser").value, password: $("loginPass").value};
+    const body = {username: $("loginUser").value.trim(), password: $("loginPass").value, remember: !setup && $("loginRemember").checked};
     if (setup) body.display_name = body.username;
     await api(setup ? "/api/setup" : "/api/login", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
     if (setup) { form.dataset.setup = "0"; await api("/api/login", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({username:body.username,password:body.password})}); }
@@ -818,6 +823,7 @@ $("authForm").addEventListener("submit", async (e) => {
 });
 
 function enterApp(user) {
+  $("loginRemember").checked = false;
   authViewVersion++;pendingEmailToken="";emailRegistrationProof=null;authResetProof="";
   for(const id of ["signupPass","signupPass2","newPass","newPass2","signupEmailCode","loginPass"])$(id).value="";
   trainingLoadRequest++; exerciseOpenRequest++; sandboxFeedbackRequest++; openAssignmentId=null;

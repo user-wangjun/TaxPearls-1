@@ -186,6 +186,10 @@
   .auth-card .field { min-width:0; margin:0 0 16px; }
   .auth-card .field label { font-size:14px; line-height:1.5; margin-bottom:6px; }
   .auth-card .field input { min-width:0; min-height:46px; border-radius:8px; padding:11px 13px; font-size:16px; line-height:1.4; }
+  .auth-remember { margin:0 0 16px; }
+  .auth-remember label { display:flex; align-items:center; gap:8px; font-size:14px; line-height:1.5; cursor:pointer; }
+  .auth-remember input { width:18px; height:18px; margin:0; flex:0 0 auto; accent-color:var(--navy); }
+  .auth-remember p { margin:4px 0 0 26px; font-size:12px; color:var(--ink-2); }
   .auth-password-row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
   .auth-card .auth-password-row .field { margin-bottom:0; }
   .auth-card .auth-help { font-size:12px; line-height:1.6; margin:6px 0 16px; color:var(--ink-2); }
@@ -374,8 +378,12 @@
     <form class="auth-card" id="authForm" data-view="login" novalidate>
       <div class="auth-brand"><img src="/logo" alt="税海拾珠"><div class="auth-brand-txt"><h2 id="authTitle">登录税海拾珠</h2><p class="auth-step" id="authStep"></p></div></div>
       <div id="viewLogin">
-        <div class="field"><label for="loginUser">用户名</label><input id="loginUser" name="username" autocomplete="username" required></div>
+        <div class="field"><label for="loginUser" id="loginUserLabel">邮箱（兼容原用户名）</label><input id="loginUser" name="username" autocomplete="username" inputmode="email" placeholder="name@example.com" required></div>
         <div class="field"><label for="loginPass">密码</label><div class="pw-wrap"><input id="loginPass" name="password" type="password" autocomplete="current-password" required><button type="button" class="pw-toggle" id="pwToggle" aria-label="显示密码" aria-pressed="false" tabindex="0"><svg class="pw-eye" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg><svg class="pw-eye-off" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:none"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><line x1="4" y1="4" x2="20" y2="20"/></svg></button></div></div>
+      </div>
+      <div class="auth-remember" id="loginRememberField">
+        <label><input id="loginRemember" name="remember" type="checkbox" aria-describedby="loginRememberHint">在此设备保持登录 30 天</label>
+        <p id="loginRememberHint">公共电脑请勿勾选</p>
       </div>
       <div id="viewForgot" style="display:none">
         <div class="field"><label for="resetEmail">账号绑定的邮箱</label><input id="resetEmail" type="email" autocomplete="email" placeholder="name@example.com" required></div>
@@ -419,9 +427,9 @@
       <button class="btn" type="submit" id="authSubmit">登录</button>
       <button type="button" class="auth-link" id="forgotLink">忘记密码？</button>
       <button type="button" class="auth-link" id="emailLoginEntryLink">使用邮箱验证码 / 邮件链接登录</button>
-      <button type="button" class="auth-link" id="passwordLoginEntryLink">使用用户名和密码登录</button>
+      <button type="button" class="auth-link" id="passwordLoginEntryLink">使用邮箱和密码登录</button>
       <button type="button" class="auth-link" id="signupEntryLink">有邀请码？前往开户</button>
-      <button type="button" class="auth-link" id="backToLogin" style="display:none">← 返回邮箱登录</button>
+      <button type="button" class="auth-link" id="backToLogin" style="display:none">← 返回密码登录</button>
     </form>
   </div>
 </section>
